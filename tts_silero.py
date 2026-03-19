@@ -90,6 +90,7 @@ class SileroTTSApp:
         self.is_model_loaded = False
         self.current_sound = None  # Для хранения текущего звукового объекта
         self.demo_text = DEFAULT_DEMO_TEXT  # Тестовый текст по умолчанию
+        self.stop_generation_flag = False  # Флаг остановки генерации
         
         logging.info("Инициализация приложения SileroTTSApp")
         
@@ -136,7 +137,8 @@ class SileroTTSApp:
                 'convert_to_mp3': bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False,
                 'mp3_bitrate': self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else '192k',
                 'speech_rate': self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium',
-                'demo_text': self.demo_text if hasattr(self, 'demo_text') else DEFAULT_DEMO_TEXT
+                'demo_text': self.demo_text if hasattr(self, 'demo_text') else DEFAULT_DEMO_TEXT,
+                'target_dir': self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
@@ -152,20 +154,16 @@ class SileroTTSApp:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Статус загрузки модели и кнопка выбора файла
-        status_frame = ttk.Frame(main_frame)
-        status_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.status_var = tk.StringVar(value="Статус: Проверка модели...")
-        status_label = ttk.Label(status_frame, textvariable=self.status_var, foreground="blue")
-        status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Кнопки загрузки тестового текста и файла
+        buttons_frame = ttk.Frame(main_frame)
+        buttons_frame.pack(fill=tk.X, pady=(0, 10))
         
         # Кнопка загрузки тестового текста
-        self.load_demo_btn = ttk.Button(status_frame, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
+        self.load_demo_btn = ttk.Button(buttons_frame, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
         self.load_demo_btn.pack(side=tk.RIGHT, padx=(10, 0))
         
         # Кнопка выбора файла
-        self.load_file_btn = ttk.Button(status_frame, text="📄 Загрузить файл (txt/fb2)", command=self.load_file)
+        self.load_file_btn = ttk.Button(buttons_frame, text="📄 Загрузить файл (txt/fb2)", command=self.load_file)
         self.load_file_btn.pack(side=tk.RIGHT, padx=(10, 0))
         
         # Вкладки
@@ -242,6 +240,10 @@ class SileroTTSApp:
         self.save_btn = ttk.Button(controls_frame, text="💾 Сохранить (WAV/MP3)", command=self.save_audio_threaded)
         self.save_btn.pack(side=tk.LEFT, padx=5)
         
+        # Кнопка объединения WAV в MP3
+        self.merge_mp3_btn = ttk.Button(controls_frame, text="🔗 Объединить в MP3", command=self.merge_wav_to_mp3_threaded)
+        self.merge_mp3_btn.pack(side=tk.LEFT, padx=5)
+        
         # Кнопка остановки
         self.stop_btn = ttk.Button(controls_frame, text="⏹ Остановить", command=self.stop_audio)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
@@ -262,6 +264,9 @@ class SileroTTSApp:
         # Настройки конвертации в MP3
         self.convert_to_mp3_var = tk.BooleanVar(value=False)
         self.mp3_bitrate_var = tk.StringVar(value="192k")
+        
+        # Целевая директория для WAV файлов
+        self.target_dir_var = tk.StringVar(value=AUDIO_DIR)
 
         self.chunk_mode_check = ttk.Checkbutton(
             chunk_frame,
@@ -311,9 +316,21 @@ class SileroTTSApp:
         self.mp3_bitrate_combo.pack(side=tk.LEFT)
         self.mp3_bitrate_combo.bind('<<ComboboxSelected>>', lambda e: self.on_chunk_settings_changed())
         
+        # Целевая директория для WAV файлов
+        ttk.Label(chunk_frame, text="Целевая директория:").pack(side=tk.LEFT, padx=(15, 5))
+        self.target_dir_entry = ttk.Entry(chunk_frame, textvariable=self.target_dir_var, width=30)
+        self.target_dir_entry.pack(side=tk.LEFT, padx=(0, 5))
+        self.target_dir_btn = ttk.Button(chunk_frame, text="📁", command=self.select_target_directory)
+        self.target_dir_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
         # Прогресс бар
         self.progress = ttk.Progressbar(main_frame, maximum=100)
         self.progress.pack(fill=tk.X, pady=10)
+        
+        # Статусная строка (в самом низу под прогресс-баром)
+        self.status_var = tk.StringVar(value="Статус: Проверка модели...")
+        status_label = ttk.Label(main_frame, textvariable=self.status_var, foreground="blue", anchor="w")
+        status_label.pack(fill=tk.X, pady=(0, 5))
         
         logging.info("Пользовательский интерфейс настроен успешно")
         
@@ -376,6 +393,10 @@ class SileroTTSApp:
             # Восстановление тестового текста
             if hasattr(self, 'demo_text') and 'demo_text' in self.saved_config:
                 self.demo_text = self.saved_config.get('demo_text', DEFAULT_DEMO_TEXT)
+            
+            # Восстановление целевой директории
+            if hasattr(self, 'target_dir_var') and 'target_dir' in self.saved_config:
+                self.target_dir_var.set(self.saved_config.get('target_dir', AUDIO_DIR))
 
             self.on_chunk_settings_changed()
         except Exception as e:
@@ -515,6 +536,9 @@ class SileroTTSApp:
 
         audio_parts = []
         for idx, chunk_text in enumerate(chunks, start=1):
+            # Проверка флага остановки
+            self.check_stop_flag()
+            
             self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
             audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
             audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
@@ -604,19 +628,27 @@ class SileroTTSApp:
                 self.show_warning("Внимание", "Режим чанков выключен. Включите 'Генерировать частями' или увеличьте текст.")
                 return
 
+            # Сброс флага остановки перед началом генерации
+            self.reset_stop_flag()
+            
             self.update_status("Статус: Озвучивание чанков...")
             self.start_progress()
 
-            if not os.path.exists(AUDIO_DIR):
-                os.makedirs(AUDIO_DIR, exist_ok=True)
+            # Получение целевой директории
+            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            
+            # Создание директории для аудио, если не существует
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+                logging.info(f"Создана директория для аудио: {target_dir}")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             custom_dir = self.chunk_dir_var.get().strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
             if not custom_dir:
                 custom_dir = "my_audiobook"
             base_name = f"{custom_dir}_{timestamp}"
-            full_path = os.path.join(AUDIO_DIR, f"{base_name}.wav")
-            parts_dir = os.path.join(AUDIO_DIR, f"{base_name}_parts")
+            full_path = os.path.join(target_dir, f"{base_name}.wav")
+            parts_dir = os.path.join(target_dir, f"{base_name}_parts")
 
             chunks = self.split_text_into_chunks(text, max_chars)
             if save_parts:
@@ -633,6 +665,9 @@ class SileroTTSApp:
 
             audio_parts = []
             for idx, chunk_text in enumerate(chunks, start=1):
+                # Проверка флага остановки
+                self.check_stop_flag()
+                
                 self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
                 audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
                 audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
@@ -655,13 +690,59 @@ class SileroTTSApp:
             extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
             self.show_info("Успех", f"Итоговый файл:\n{full_path}{extra}")
             self.stop_progress()
-
+            
+        except InterruptedError:
+            # Обработка остановки пользователем
+            logging.info("Озвучивание чанков остановлено пользователем")
+            self.update_status("Статус: Озвучивание остановлено пользователем")
+            self.stop_progress()
+            
         except Exception as e:
             logging.error(f"Ошибка при озвучивании чанков: {e}", exc_info=True)
             self.update_status("Статус: Ошибка ❌")
             self.show_error("Ошибка", str(e))
             self.stop_progress()
 
+    def _extract_fb2_from_zip(self, zip_path):
+        """Извлечение FB2 файла из ZIP архива и парсинг текста"""
+        import zipfile
+        import xml.etree.ElementTree as ET
+        import io
+        
+        logging.info(f"Распаковка ZIP архива: {zip_path}")
+        
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Поиск FB2 файлов в архиве
+            fb2_files = [f for f in zf.namelist() if f.lower().endswith('.fb2')]
+            
+            if not fb2_files:
+                raise Exception("В ZIP архиве не найдено файлов формата FB2")
+            
+            if len(fb2_files) > 1:
+                logging.warning(f"Найдено несколько FB2 файлов: {fb2_files}. Будет использован первый: {fb2_files[0]}")
+            
+            fb2_filename = fb2_files[0]
+            logging.info(f"Извлечение FB2 файла: {fb2_filename}")
+            
+            # Чтение содержимого FB2 файла
+            with zf.open(fb2_filename) as fb2_file:
+                fb2_content = fb2_file.read()
+                
+            # Парсинг FB2 из памяти
+            root = ET.parse(io.BytesIO(fb2_content)).getroot()
+            
+            # Извлечение текста из FB2
+            text_parts = []
+            for elem in root.iter():
+                if elem.tag.endswith('p') or elem.tag.endswith('title'):
+                    if elem.text:
+                        text_parts.append(elem.text.strip())
+            
+            text = '\n'.join(text_parts)
+            logging.info(f"Текст извлечён из FB2 в ZIP (длина: {len(text)})")
+            
+            return text
+    
     def _write_wav_int16_mono(self, path, audio_int16):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with wave.open(path, 'wb') as wf:
@@ -671,13 +752,15 @@ class SileroTTSApp:
             wf.writeframes(audio_int16.tobytes())
     
     def load_file(self):
-        """Загрузка текста из файла txt или fb2"""
+        """Загрузка текста из файла txt, fb2 или zip с fb2 внутри"""
         try:
             from tkinter import filedialog
+            import zipfile
             
             filetypes = [
                 ('Текстовые файлы', '*.txt;*.md'),
                 ('FB2 файлы', '*.fb2'),
+                ('ZIP архивы с FB2', '*.zip'),
                 ('Все файлы', '*.*')
             ]
             
@@ -694,7 +777,10 @@ class SileroTTSApp:
             # Определение формата файла
             file_ext = os.path.splitext(file_path)[1].lower()
             
-            if file_ext == '.fb2':
+            if file_ext == '.zip':
+                # Поиск FB2 файла внутри ZIP архива
+                text = self._extract_fb2_from_zip(file_path)
+            elif file_ext == '.fb2':
                 # Парсинг FB2 (простой вариант - извлечение текста из тегов <p>)
                 import xml.etree.ElementTree as ET
                 tree = ET.parse(file_path)
@@ -753,6 +839,161 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при загрузке тестового текста: {e}", exc_info=True)
             self.show_error("Ошибка", f"Не удалось загрузить тестовый текст: {e}")
+    
+    def select_target_directory(self):
+        """Выбор целевой директории для WAV файлов"""
+        try:
+            from tkinter import filedialog
+            
+            # Выбор директории
+            directory = filedialog.askdirectory(
+                title="Выберите директорию для сохранения WAV файлов",
+                initialdir=self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            )
+            
+            if directory:
+                self.target_dir_var.set(directory)
+                logging.info(f"Целевая директория установлена: {directory}")
+                self.save_config()
+                self.update_status(f"Статус: Целевая директория: {directory} ✅")
+            
+        except Exception as e:
+            logging.error(f"Ошибка при выборе директории: {e}", exc_info=True)
+            self.show_error("Ошибка", f"Не удалось выбрать директорию: {e}")
+    
+    def merge_wav_to_mp3_threaded(self):
+        """Запуск объединения WAV в MP3 в отдельном потоке"""
+        try:
+            from tkinter import filedialog
+            
+            # Получение целевой директории по умолчанию
+            default_dir = AUDIO_DIR
+            if hasattr(self, 'target_dir_var'):
+                default_dir = self.target_dir_var.get()
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                default_dir = self.saved_config['target_dir']
+            
+            # Выбор директории с WAV файлами (по умолчанию - целевая директория)
+            directory = filedialog.askdirectory(
+                title="Выберите директорию с WAV файлами",
+                initialdir=default_dir
+            )
+            if not directory:
+                return
+            
+            logging.info(f"Выбрана директория: {directory}")
+            
+            # Запуск в отдельном потоке
+            thread = threading.Thread(target=self.merge_wav_to_mp3, args=(directory,), daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logging.error(f"Ошибка при выборе директории: {e}", exc_info=True)
+            self.show_error("Ошибка", f"Не удалось выбрать директорию: {e}")
+    
+    def merge_wav_to_mp3(self, directory):
+        """Объединение WAV файлов из директории в один MP3 файл"""
+        try:
+            self.reset_stop_flag()
+            
+            logging.info(f"=== Начало объединения WAV в MP3 из: {directory} ===")
+            self.update_status("Статус: Поиск WAV файлов...")
+            
+            # Поиск всех WAV файлов в директории
+            wav_files = sorted([
+                os.path.join(directory, f) 
+                for f in os.listdir(directory) 
+                if f.lower().endswith('.wav') and not f.startswith('~')
+            ])
+            
+            if not wav_files:
+                self.show_warning("Внимание", f"В директории не найдено WAV файлов:\n{directory}")
+                self.update_status("Статус: WAV файлы не найдены")
+                return
+            
+            logging.info(f"Найдено WAV файлов: {len(wav_files)}")
+            self.update_status(f"Статус: Найдено {len(wav_files)} WAV файлов")
+            
+            # Запуск прогресс-бара
+            self.start_progress(total_chunks=len(wav_files))
+            
+            # Загрузка и объединение аудио
+            audio_parts = []
+            for idx, wav_path in enumerate(wav_files, start=1):
+                # Проверка флага остановки
+                self.check_stop_flag()
+                
+                self.update_status(f"Статус: Обработка {idx}/{len(wav_files)}...")
+                logging.info(f"Загрузка WAV: {wav_path} ({idx}/{len(wav_files)})")
+                
+                try:
+                    audio = AudioSegment.from_wav(wav_path)
+                    audio_parts.append(audio)
+                except Exception as e:
+                    logging.warning(f"Не удалось загрузить {wav_path}: {e}")
+                
+                # Обновление прогресс-бара
+                self.update_progress(idx)
+            
+            if not audio_parts:
+                self.show_error("Ошибка", "Не удалось загрузить ни один WAV файл")
+                self.update_status("Статус: Ошибка объединения")
+                self.stop_progress()
+                return
+            
+            # Объединение аудио
+            self.update_status("Статус: Объединение аудио...")
+            logging.info("Объединение аудио файлов")
+            combined_audio = audio_parts[0]
+            for audio in audio_parts[1:]:
+                combined_audio += audio
+            
+            # Получение битрейта из настроек
+            bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else "192k"
+            
+            # Создание MP3 файла
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mp3_path = os.path.join(directory, f"combined_{timestamp}.mp3")
+            
+            self.update_status(f"Статус: Конвертация в MP3 (битрейт: {bitrate})...")
+            logging.info(f"Экспорт в MP3: {mp3_path} (битрейт: {bitrate})")
+            
+            combined_audio.export(mp3_path, format="mp3", bitrate=bitrate)
+            
+            if os.path.exists(mp3_path):
+                mp3_size = os.path.getsize(mp3_path) / 1024
+                # Расчёт длительности аудио в секундах
+                duration_seconds = len(combined_audio) / 1000.0  # pydub использует миллисекунды
+                duration_hours = int(duration_seconds // 3600)
+                duration_minutes = int((duration_seconds % 3600) // 60)
+                duration_secs_remaining = int(duration_seconds % 60)
+                duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
+                
+                logging.info(f"MP3 файл создан: {mp3_path} (размер: {mp3_size:.2f} КБ, битрейт: {bitrate}, длительность: {duration_formatted})")
+                self.update_status(f"Статус: MP3 создан ✅")
+                self.show_info(
+                    "Успех", 
+                    f"Создан MP3 файл:\n{mp3_path}\n\n"
+                    f"Объединено файлов: {len(audio_parts)}\n"
+                    f"Размер: {mp3_size:.2f} КБ\n"
+                    f"Битрейт: {bitrate}\n"
+                    f"Длительность: {duration_formatted} ({duration_seconds:.1f} сек)"
+                )
+            else:
+                raise Exception("MP3 файл не был создан")
+            
+            self.stop_progress()
+            
+        except InterruptedError:
+            logging.info("Объединение остановлено пользователем")
+            self.update_status("Статус: Объединение остановлено")
+            self.stop_progress()
+            
+        except Exception as e:
+            logging.error(f"Ошибка при объединении WAV в MP3: {e}", exc_info=True)
+            self.update_status("Статус: Ошибка объединения ❌")
+            self.show_error("Ошибка", f"Не удалось объединить WAV файлы:\n{e}")
+            self.stop_progress()
     
     def load_model_threaded(self):
         """Загрузка модели в отдельном потоке"""
@@ -940,6 +1181,9 @@ class SileroTTSApp:
         logging.info(f"=== Начало воспроизведения: текст='{text[:50]}...', голос='{speaker}' ===")
         
         try:
+            # Сброс флага остановки перед началом генерации
+            self.reset_stop_flag()
+            
             self.update_status(f"Статус: Генерация речи голосом '{speaker}'...")
             self.start_progress()
 
@@ -1005,6 +1249,11 @@ class SileroTTSApp:
             self.update_status(f"Статус: Готово (голос: {speaker}) ✅")
             self.stop_progress()
             
+        except InterruptedError:
+            # Обработка остановки пользователем
+            logging.info("Воспроизведение остановлено пользователем")
+            self.stop_progress()
+            
         except Exception as e:
             logging.error(f"Ошибка при воспроизведении аудио: {str(e)}", exc_info=True)
             self.update_status("Статус: Ошибка ❌")
@@ -1012,17 +1261,36 @@ class SileroTTSApp:
             self.stop_progress()
     
     def stop_audio(self):
-        """Остановка воспроизведения"""
+        """Остановка воспроизведения и генерации"""
         try:
-            if pygame.mixer.get_init():  # Проверяем, инициализирован ли микшер
+            # Остановка воспроизведения
+            if pygame.mixer.get_init():
                 pygame.mixer.stop()
                 if self.current_sound:
                     self.current_sound.stop()
                     self.current_sound = None
                 self.update_status("Статус: Воспроизведение остановлено")
                 logging.info("Воспроизведение остановлено пользователем")
+            
+            # Установка флага остановки генерации
+            self.stop_generation_flag = True
+            logging.info("Установлен флаг остановки генерации")
+            
         except Exception as e:
-            logging.error(f"Ошибка при остановке воспроизведения: {e}")
+            logging.error(f"Ошибка при остановке: {e}")
+    
+    def reset_stop_flag(self):
+        """Сброс флага остановки перед началом новой генерации"""
+        self.stop_generation_flag = False
+        logging.debug("Флаг остановки генерации сброшен")
+    
+    def check_stop_flag(self):
+        """Проверка флага остановки. Вызывает исключение при остановке."""
+        if self.stop_generation_flag:
+            logging.info("Генерация остановлена пользователем")
+            self.update_status("Статус: Генерация остановлена пользователем")
+            self.stop_progress()
+            raise InterruptedError("Генерация остановлена пользователем")
     
     def save_audio_threaded(self):
         """Запуск сохранения аудио в отдельном потоке"""
@@ -1046,13 +1314,19 @@ class SileroTTSApp:
         logging.info(f"=== Начало сохранения аудио: текст='{text[:50]}...', голос='{speaker}' ===")
         
         try:
+            # Сброс флага остановки перед началом генерации
+            self.reset_stop_flag()
+            
             self.update_status(f"Статус: Генерация для сохранения...")
             self.start_progress()
             
+            # Получение целевой директории
+            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            
             # Создание директории для аудио, если не существует
-            if not os.path.exists(AUDIO_DIR):
-                os.makedirs(AUDIO_DIR, exist_ok=True)
-                logging.info(f"Создана директория для аудио: {AUDIO_DIR}")
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+                logging.info(f"Создана директория для аудио: {target_dir}")
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             custom_dir = self.chunk_dir_var.get().strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
@@ -1065,7 +1339,7 @@ class SileroTTSApp:
 
             if not use_chunking:
                 filename = f"{base_name}.wav"
-                full_path = os.path.join(AUDIO_DIR, filename)
+                full_path = os.path.join(target_dir, filename)
                 logging.info(f"Сохранение в файл: {full_path}")
 
                 self.model.save_wav(
@@ -1086,6 +1360,9 @@ class SileroTTSApp:
                 
                 audio_parts = []
                 for idx, chunk_text in enumerate(chunks, start=1):
+                    # Проверка флага остановки
+                    self.check_stop_flag()
+                    
                     self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
                     speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
                     audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
@@ -1094,7 +1371,7 @@ class SileroTTSApp:
                     
                     # Сохраняем часть если нужно
                     if save_parts:
-                        parts_dir = os.path.join(AUDIO_DIR, f"{base_name}_parts")
+                        parts_dir = os.path.join(target_dir, f"{base_name}_parts")
                         os.makedirs(parts_dir, exist_ok=True)
                         logging.info(f"Сохранение частей в: {parts_dir}")
                         part_filename = f"part_{idx:03d}.wav"
@@ -1108,7 +1385,7 @@ class SileroTTSApp:
                     self.update_progress(idx)
 
                 filename = f"{base_name}.wav"
-                full_path = os.path.join(AUDIO_DIR, filename)
+                full_path = os.path.join(target_dir, filename)
                 logging.info(f"Сохранение итогового WAV: {full_path}")
                 audio_full_int16 = np.concatenate(audio_parts) if audio_parts else np.zeros((0,), dtype=np.int16)
                 self._write_wav_int16_mono(full_path, audio_full_int16)
@@ -1142,14 +1419,14 @@ class SileroTTSApp:
                     self.update_status(f"Статус: Сохранено в MP3 ✅")
                     extra = ""
                     if use_chunking and save_parts:
-                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(AUDIO_DIR, f'{base_name}_parts')}"
+                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(target_dir, f'{base_name}_parts')}"
                     message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\nРазмер: {mp3_size:.2f} КБ, битрейт: {bitrate}{extra}"
                     # WAV файл был удалён
                 else:
                     self.update_status(f"Статус: Сохранено в {os.path.basename(full_path)} ✅")
                     extra = ""
                     if use_chunking and save_parts:
-                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(AUDIO_DIR, f'{base_name}_parts')}"
+                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(target_dir, f'{base_name}_parts')}"
                     message = f"Аудио сохранено в файл:\n{full_path}\n\nРазмер: {file_size:.2f} КБ{extra}"
                 
                 self.show_info("Успех", message)
@@ -1157,6 +1434,12 @@ class SileroTTSApp:
                 logging.error(f"Файл {full_path} не был создан")
                 raise Exception("Файл не был создан")
             
+            self.stop_progress()
+            
+        except InterruptedError:
+            # Обработка остановки пользователем
+            logging.info("Сохранение аудио остановлено пользователем")
+            self.update_status("Статус: Сохранение остановлено пользователем")
             self.stop_progress()
             
         except Exception as e:
@@ -1198,17 +1481,46 @@ class SileroTTSApp:
     def open_audio_folder(self):
         """Открытие папки с аудиофайлами в проводнике Windows"""
         try:
-            # Создание директории, если не существует
-            if not os.path.exists(AUDIO_DIR):
-                os.makedirs(AUDIO_DIR, exist_ok=True)
-                logging.info(f"Создана директория для аудио: {AUDIO_DIR}")
+            # Получение целевой директории: приоритет - переменная, затем конфиг, затем AUDIO_DIR
+            if hasattr(self, 'target_dir_var'):
+                raw_target = self.target_dir_var.get()
+                source = "target_dir_var"
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                raw_target = self.saved_config['target_dir']
+                source = "saved_config"
+            else:
+                raw_target = AUDIO_DIR
+                source = "AUDIO_DIR"
             
-            # Открытие папки в проводнике (explorer возвращает 1, но работает)
-            subprocess.Popen(['explorer', AUDIO_DIR])
-            logging.info(f"Открыта папка с аудио: {AUDIO_DIR}")
+            # Нормализация пути для Windows (конвертация слэшей)
+            target_dir = os.path.normpath(raw_target)
+            
+            # Детальное логирование для отладки
+            logging.info(f"Источник пути: {source}")
+            logging.info(f"Сырой путь: {raw_target}")
+            logging.info(f"Нормализованный путь: {target_dir}")
+            logging.info(f"Путь существует: {os.path.exists(target_dir)}")
+            
+            # Создание директории, если не существует
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+                logging.info(f"Создана директория для аудио: {target_dir}")
+            
+            # Открытие папки в проводнике Windows через os.startfile (более надёжно)
+            os.startfile(target_dir)
+            logging.info(f"Открыта папка с аудио: {target_dir}")
+            self.update_status(f"Статус: Открыта папка: {target_dir} ✅")
         except Exception as e:
-            logging.error(f"Ошибка при открытии папки: {e}")
-            self.show_error("Ошибка", f"Не удалось открыть папку:\n{AUDIO_DIR}\n\nОшибка: {e}")
+            logging.error(f"Ошибка при открытии папки: {e}", exc_info=True)
+            # Повторное получение директории для отображения в ошибке
+            if hasattr(self, 'target_dir_var'):
+                raw_target = self.target_dir_var.get()
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                raw_target = self.saved_config['target_dir']
+            else:
+                raw_target = AUDIO_DIR
+            target_dir = os.path.normpath(raw_target)
+            self.show_error("Ошибка", f"Не удалось открыть папку:\n{target_dir}\n\nОшибка: {e}")
     
     def cleanup(self):
         """Очистка ресурсов при закрытии"""
