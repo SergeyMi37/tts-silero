@@ -514,6 +514,40 @@ class SileroTTSApp:
             self.root.after(0, lambda err=e: self.preprocessor_status_var.set("Модели предобработки: ошибка загрузки"))
             self.root.after(0, lambda err=e: self.show_error("Ошибка", f"Не удалось загрузить модели предобработки:\n{err}"))
 
+    def _preprocess_text_for_tts(self, text, status_message="Статус: Предобработка текста...", log_context=""):
+        """Применение настроек предобработки текста.
+
+        Важно: замена чисел словами работает независимо от опции
+        "Использовать предобработку текста".
+        """
+        if not text:
+            return text
+
+        use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
+        use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
+        use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
+
+        processed_text = text
+
+        if use_num2words:
+            processed_text = self.text_preprocessor.replace_numbers_with_words(processed_text)
+
+        if use_preprocessing and self.preprocessor_loaded:
+            self.update_status(status_message)
+            processed_text = self.text_preprocessor.preprocess(
+                processed_text,
+                use_num2words=False,
+                use_ruaccent=use_ruaccent
+            )
+        elif use_preprocessing and not self.preprocessor_loaded:
+            logging.warning("Предобработка включена, но модели ещё не загружены. Применена только замена чисел.")
+
+        if processed_text != text:
+            context_suffix = f" {log_context}" if log_context else ""
+            logging.info(f"Текст предобработан{context_suffix} (длина: {len(processed_text)})")
+
+        return processed_text
+
     def _get_chunk_settings(self):
         max_chars = int(str(self.max_chars_var.get()).strip())
         if max_chars < 200:
@@ -662,16 +696,11 @@ class SileroTTSApp:
                 self.show_warning("Внимание", "Введите текст для разделения")
                 return
 
-            # Предобработка текста если включена (для отображения в чанках)
-            use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-            use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
-            
-            text_for_display = text
-            if use_preprocessing and self.preprocessor_loaded:
-                self.update_status("Статус: Предобработка текста для чанков...")
-                text_for_display = self.text_preprocessor.preprocess(text, use_num2words=use_num2words, use_ruaccent=use_ruaccent)
-                logging.info(f"Текст предобработан для чанков (длина: {len(text_for_display)})")
+            text_for_display = self._preprocess_text_for_tts(
+                text,
+                status_message="Статус: Предобработка текста для чанков...",
+                log_context="для чанков"
+            )
             
             chunks = self.split_text_into_chunks(text_for_display, max_chars)
             if not chunks:
@@ -745,16 +774,8 @@ class SileroTTSApp:
                 if not text:
                     self.show_warning("Внимание", "Введите текст для озвучки")
                     return
-                
-                # Предобработка текста если включена
-                use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-                use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-                use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
-                
-                if use_preprocessing and self.preprocessor_loaded:
-                    self.update_status("Статус: Предобработка текста...")
-                    text = self.text_preprocessor.preprocess(text, use_num2words=use_num2words, use_ruaccent=use_ruaccent)
-                    logging.info(f"Текст предобработан (длина: {len(text)})")
+
+                text = self._preprocess_text_for_tts(text)
                 
                 _, _, max_chars, _ = self._get_chunk_settings()
                 chunks = self.split_text_into_chunks(text, max_chars)
@@ -1319,16 +1340,8 @@ class SileroTTSApp:
         try:
             # Сброс флага остановки перед началом генерации
             self.reset_stop_flag()
-            
-            # Предобработка текста если включена
-            use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-            use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
-            
-            if use_preprocessing and self.preprocessor_loaded:
-                self.update_status("Статус: Предобработка текста...")
-                text = self.text_preprocessor.preprocess(text, use_num2words=use_num2words, use_ruaccent=use_ruaccent)
-                logging.info(f"Текст предобработан (длина: {len(text)})")
+
+            text = self._preprocess_text_for_tts(text)
             
             self.update_status(f"Статус: Генерация речи голосом '{speaker}'...")
             self.start_progress()
@@ -1462,16 +1475,8 @@ class SileroTTSApp:
         try:
             # Сброс флага остановки перед началом генерации
             self.reset_stop_flag()
-            
-            # Предобработка текста если включена
-            use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-            use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
-            
-            if use_preprocessing and self.preprocessor_loaded:
-                self.update_status("Статус: Предобработка текста...")
-                text = self.text_preprocessor.preprocess(text, use_num2words=use_num2words, use_ruaccent=use_ruaccent)
-                logging.info(f"Текст предобработан (длина: {len(text)})")
+
+            text = self._preprocess_text_for_tts(text)
             
             self.update_status(f"Статус: Генерация для сохранения...")
             self.start_progress()

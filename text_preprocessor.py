@@ -211,6 +211,8 @@ class TextPreprocessor:
         
         Поддерживает:
         - Целые числа (123 → сто двадцать три)
+        - Четырехзначные числа (1955 → одна тысяча пятьдесят пять)
+        - Четырехзначные числа перед "год" (1955 год → одна тысяча пятьдесят пятый год)
         - Десятичные числа (3.14 → три целых четырнадцать сотых)
         - Числа с разделителями тысяч (1 000 000 → один миллион)
         
@@ -230,11 +232,72 @@ class TextPreprocessor:
             logger.warning("num2words не установлен, преобразование чисел пропущено")
             return text
         
-        def replace_number(match):
+        def get_ordinal_form(cardinal_text: str) -> str:
+            """
+            Преобразует кардинальное число в порядственное.
+            Например: "пятьдесят пять" → "пятьдесят пятый"
+            """
+            # Словарь для преобразования окончаний
+            ordinal_mappings = {
+                'один': 'первый',
+                'два': 'второй',
+                'три': 'третий',
+                'четыре': 'четвертый',
+                'пять': 'пятый',
+                'шесть': 'шестой',
+                'семь': 'седьмой',
+                'восемь': 'восьмой',
+                'девять': 'девятый',
+                'десять': 'десятый',
+                'одиннадцать': 'одиннадцатый',
+                'двенадцать': 'двенадцатый',
+                'тринадцать': 'тринадцатый',
+                'четырнадцать': 'четырнадцатый',
+                'пятнадцать': 'пятнадцатый',
+                'шестнадцать': 'шестнадцатый',
+                'семнадцать': 'семнадцатый',
+                'восемнадцать': 'восемнадцатый',
+                'девятнадцать': 'девятнадцатый',
+                'двадцать': 'двадцатый',
+                'тридцать': 'тридцатый',
+                'сорок': 'сороковой',
+                'пятьдесят': 'пятидесятый',
+                'шестьдесят': 'шестидесятый',
+                'семьдесят': 'семидесятый',
+                'восемьдесят': 'восьмидесятый',
+                'девяносто': 'девяностый',
+                'сто': 'сотый',
+                'двести': 'двухсотый',
+                'триста': 'трехсотый',
+                'четыреста': 'четырехсотый',
+                'пятьсот': 'пятисотый',
+                'шестьсот': 'шестисотый',
+                'семьсот': 'семисотый',
+                'восемьсот': 'восьмисотый',
+                'девятьсот': 'девяти сотый',
+            }
+            
+            words = cardinal_text.split()
+            if not words:
+                return cardinal_text
+            
+            # Изменяем только последнее слово
+            last_word = words[-1].lower()
+            if last_word in ordinal_mappings:
+                words[-1] = ordinal_mappings[last_word]
+            
+            return ' '.join(words)
+        
+        def replace_number(match, check_year=False):
             num_str = match.group(0)
+            next_word = match.group('next_word') if check_year else None
+            
             try:
                 # Очистка от разделителей тысяч (пробелы, запятые)
                 clean_num = num_str.replace(' ', '').replace(',', '.')
+                
+                # Проверка на четырехзначное число (год)
+                is_four_digit = re.match(r'^\d{4}$', clean_num) is not None
                 
                 # Проверка на десятичное число
                 if '.' in clean_num:
@@ -280,7 +343,32 @@ class TextPreprocessor:
                 else:
                     # Целое число
                     num = int(clean_num)
-                    return num2words(num, lang='ru')
+                    
+                    # Специальная обработка четырехзначных чисел (годы)
+                    if is_four_digit and 1000 <= num <= 9999:
+                        # Разбиваем на тысячи и остаток
+                        thousands = num // 1000
+                        remainder = num % 1000
+                        
+                        # Получаем слово для тысяч
+                        if thousands == 1:
+                            result = 'одна тысяча'
+                        else:
+                            result = num2words(thousands, lang='ru') + ' тысячи'
+                        
+                        # Добавляем остаток
+                        if remainder > 0:
+                            remainder_words = num2words(remainder, lang='ru')
+                            result += ' ' + remainder_words
+                        
+                        # Если за числом следует "год", используем порядковое окончание
+                        if check_year and next_word and next_word.lower() in ['год', 'года', 'году', 'годом', 'годе']:
+                            result = get_ordinal_form(result)
+                        
+                        return result
+                    else:
+                        # Обычное число
+                        return num2words(num, lang='ru')
                     
             except (ValueError, OverflowError) as e:
                 logger.warning(f"Не удалось преобразовать число {num_str}: {e}")
@@ -289,12 +377,37 @@ class TextPreprocessor:
                 logger.warning(f"Ошибка при преобразовании числа {num_str}: {e}")
                 return num_str
         
-        # Паттерн для поиска чисел (целые и десятичные, с разделителями тысяч)
-        # Поддерживает: 123, 1 000, 1.5, 3,14, 1 000 000
-        # Убраны \b границы для лучшей работы с русским текстом
-        number_pattern = r'(?<![а-яА-ЯёЁa-zA-Z])\d{1,3}(?:[ \u00A0]?\d{3})*(?:[.,]\d+)?(?![а-яА-ЯёЁa-zA-Z])'
+        # Паттерн для поиска чисел с проверкой на "год" после
+        # Поддерживает: 123, 1 000, 1.5, 3,14, 1 000 000, 1955 год
+        # Сначала обрабатываем 4-значные числа перед "год"
+        number_pattern_with_year = r'(?<![а-яА-ЯёЁa-zA-Z0-9])(\d{4})\s+(год|года|году|годом|годе)(?![а-яА-ЯёЁa-zA-Z0-9])'
+        number_pattern = r'(?<![а-яА-ЯёЁa-zA-Z0-9])\d{1,3}(?:[ \u00A0]?\d{3})*(?:[.,]\d+)?(?![а-яА-ЯёЁa-zA-Z0-9])'
         
-        result = re.sub(number_pattern, replace_number, text)
+        # Сначала обрабатываем числа с "год"
+        def replace_with_year(match):
+            num_str = match.group(1)
+            year_word = match.group(2)
+            
+            # Создаем фейковый match объект для replace_number
+            class FakeMatch:
+                def group(self, n=0):
+                    if n == 0:
+                        return num_str
+                    return num_str
+                @property
+                def string(self):
+                    return text
+            
+            fake_match = FakeMatch()
+            cardinal_result = replace_number(fake_match, check_year=False)
+            ordinal_result = get_ordinal_form(cardinal_result)
+            return ordinal_result + ' ' + year_word
+        
+        result = re.sub(number_pattern_with_year, replace_with_year, text)
+        
+        # Затем обрабатываем остальные числа
+        result = re.sub(number_pattern, lambda m: replace_number(m, check_year=False), result)
+        
         logger.info(f"Числа преобразованы в слова: '{text[:50]}...' → '{result[:50]}...'")
         return result
     
