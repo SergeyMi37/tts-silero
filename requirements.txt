@@ -3,3 +3,6 @@ numpy
 pygame
 scipy
 pydub
+num2words>=0.5.13
+silero-stress>=0.1.0
+ruaccent>=1.0.0
