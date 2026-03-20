@@ -15,6 +15,7 @@ import re
 import wave
 from pydub import AudioSegment
 from text_preprocessor import TextPreprocessor
+import html
 
 # Константы для логирования
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
@@ -736,8 +737,19 @@ class SileroTTSApp:
             self.chunks_area.insert(tk.END, f"Скорость: {speech_rate}\n\n")
 
             for idx, chunk_text in enumerate(chunks, start=1):
+                # Логирование для отладки: содержимое chunk_text до обработки
+                logging.debug(f"CHUNK {idx:03d} (до обработки): '{chunk_text[:100]}...' (длина: {len(chunk_text)})")
+                
+                # Экранируем XML-символы в chunk_text перед вставкой в SSML
+                # Это сохраняет ударения и другие специальные символы
+                chunk_text_escaped = html.escape(chunk_text, quote=False)
+                
                 # Оборачиваем каждый чанк в SSML теги скорости
-                chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_text}</prosody></speak>'
+                chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_text_escaped}</prosody></speak>'
+                
+                # Логирование для отладки: финальный SSML
+                logging.debug(f"CHUNK {idx:03d} (SSML): '{chunk_with_ssml[:120]}...' (длина: {len(chunk_with_ssml)})")
+                
                 self.chunks_area.insert(
                     tk.END,
                     f"==== CHUNK {idx:03d} -> part_{idx:03d}.wav ====\n{chunk_with_ssml}\n\n"
@@ -752,6 +764,55 @@ class SileroTTSApp:
             logging.error(f"Ошибка при разделении на кусочки: {e}", exc_info=True)
             self.show_error("Ошибка", str(e))
 
+    def _parse_chunks_from_ui(self):
+        """Парсинг чанков из chunks_area (извлекает текст между ==== CHUNK ... ==== и следующим ====)"""
+        try:
+            chunks_content = self.chunks_area.get("1.0", tk.END).strip()
+            if not chunks_content:
+                return []
+            
+            # Разделяем по маркерам CHUNK - более надёжный regex
+            # Ищем все вхождения ==== CHUNK X -> part_X.wav ====
+            chunk_markers = list(re.finditer(r'==== CHUNK (\d+) -> part_(\d+)\.wav ====', chunks_content))
+            
+            if not chunk_markers:
+                logging.warning("Не найдено маркеров CHUNK в chunks_area")
+                return []
+            
+            parsed_chunks = []
+            for i, match in enumerate(chunk_markers):
+                chunk_num = int(match.group(1))
+                start_pos = match.end()
+                
+                # Конец чанка - начало следующего маркера или конец текста
+                if i + 1 < len(chunk_markers):
+                    end_pos = chunk_markers[i + 1].start()
+                else:
+                    end_pos = len(chunks_content)
+                
+                # Извлекаем текст чанка
+                chunk_text = chunks_content[start_pos:end_pos].strip()
+                
+                if chunk_text:
+                    # Удаляем переносы строк из текста чанка
+                    chunk_text = chunk_text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+                    # Удаляем символы = и пробелы в конце (артефакты UI)
+                    chunk_text = chunk_text.rstrip(' =\t')
+                    # Удаляем множественные пробелы
+                    chunk_text = ' '.join(chunk_text.split())
+                    
+                    parsed_chunks.append((chunk_num, chunk_text))
+            
+            # Сортируем чанки по номеру и возвращаем только текст
+            parsed_chunks.sort(key=lambda x: x[0])
+            result = [text for _, text in parsed_chunks]
+            
+            logging.info(f"Распарсено {len(result)} чанков из UI (найдено маркеров: {len(chunk_markers)})")
+            return result
+        except Exception as e:
+            logging.error(f"Ошибка при парсинге чанков из UI: {e}", exc_info=True)
+            return []
+
     def speak_chunks_threaded(self):
         if not self.is_model_loaded:
             self.show_warning("Внимание", "Модель ещё загружается. Пожалуйста, подождите.")
@@ -761,15 +822,24 @@ class SileroTTSApp:
 
     def speak_chunks(self):
         try:
-            # Проверяем, есть ли уже готовые чанки из UI (с предобработкой)
-            use_existing_chunks = hasattr(self, 'last_chunk_plan') and self.last_chunk_plan and 'chunks' in self.last_chunk_plan
+            chunks = None
+            chunks_source = None
             
-            if use_existing_chunks:
-                # Используем готовые чанки из UI (уже с предобработкой)
+            # 1. Сначала пытаемся получить чанки из UI (chunks_area) - там уже полные SSML-теги
+            if hasattr(self, 'chunks_area'):
+                chunks = self._parse_chunks_from_ui()
+                if chunks:
+                    chunks_source = "UI (chunks_area с SSML)"
+                    logging.info(f"Используются чанки из UI (количество: {len(chunks)})")
+            
+            # 2. Если в UI нет чанков, пробуем last_chunk_plan
+            if not chunks and hasattr(self, 'last_chunk_plan') and self.last_chunk_plan and 'chunks' in self.last_chunk_plan:
                 chunks = self.last_chunk_plan['chunks']
-                logging.info(f"Используются готовые чанки из UI (количество: {len(chunks)})")
-            else:
-                # Разбиваем текст заново если чанков нет
+                chunks_source = "last_chunk_plan"
+                logging.info(f"Используются готовые чанки из last_chunk_plan (количество: {len(chunks)})")
+            
+            # 3. Если чанков нет, разбиваем текст заново
+            if not chunks:
                 text = self.text_area.get("1.0", tk.END).strip()
                 if not text:
                     self.show_warning("Внимание", "Введите текст для озвучки")
@@ -779,6 +849,7 @@ class SileroTTSApp:
                 
                 _, _, max_chars, _ = self._get_chunk_settings()
                 chunks = self.split_text_into_chunks(text, max_chars)
+                chunks_source = "разбиение текста"
             
             if not chunks:
                 self.show_warning("Внимание", "Не удалось получить кусочки")
@@ -826,6 +897,9 @@ class SileroTTSApp:
                 self.check_stop_flag()
                 
                 self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                
+                # При использовании чанков из UI, передаём в generate_audio() уже готовый SSML-текст
+                # generate_audio() сам распознает SSML теги и использует их без дополнительной обёртки
                 audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
                 audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
 
@@ -843,9 +917,36 @@ class SileroTTSApp:
             audio_full_int16 = np.concatenate(audio_parts) if audio_parts else np.zeros((0,), dtype=np.int16)
             self._write_wav_int16_mono(full_path, audio_full_int16)
 
+            # Конвертация в MP3 если включена опция
+            convert_to_mp3 = bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False
+            mp3_path = None
+            if convert_to_mp3:
+                self.update_status(f"Статус: Конвертация в MP3...")
+                bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else "192k"
+                try:
+                    mp3_path = self.convert_wav_to_mp3(full_path, bitrate)
+                    logging.info(f"MP3 файл создан: {mp3_path}")
+                    
+                    # Удаляем WAV файл после успешной конвертации в MP3
+                    try:
+                        os.remove(full_path)
+                        logging.info(f"WAV файл удалён: {full_path}")
+                    except Exception as remove_error:
+                        logging.warning(f"Не удалось удалить WAV файл: {remove_error}")
+                except Exception as mp3_error:
+                    logging.error(f"Ошибка конвертации в MP3: {mp3_error}")
+                    self.show_warning("Предупреждение", f"WAV сохранён, но конвертация в MP3 не удалась:\n{str(mp3_error)}")
+            
             self.update_status(f"Статус: Сохранено (кусочки) ✅")
-            extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
-            self.show_info("Успех", f"Итоговый файл:\n{full_path}{extra}")
+            if mp3_path:
+                mp3_size = os.path.getsize(mp3_path) / 1024
+                extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
+                message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\nРазмер: {mp3_size:.2f} КБ, битрейт: {bitrate}{extra}"
+            else:
+                wav_size = os.path.getsize(full_path) / 1024
+                extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
+                message = f"Аудио сохранено в файл:\n{full_path}\n\nРазмер: {wav_size:.2f} КБ{extra}"
+            self.show_info("Успех", message)
             self.stop_progress()
             
         except InterruptedError:
@@ -1231,18 +1332,47 @@ class SileroTTSApp:
         if speech_rate is None:
             speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
         
-        logging.info(f"Генерация аудио: текст='{text[:100]}...' (длина: {len(text)}), голос='{speaker}', скорость='{speech_rate}'")
-        
         try:
+            # Очистка текста от неподдерживаемых XML-символов
+            # Silero TTS v5 не поддерживает переносы строк, русские кавычки и другие спецсимволы в SSML
+            def clean_xml_text(text):
+                # Удаляем переносы строк (заменяем на пробелы)
+                text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+                # Заменяем русские кавычки на стандартные
+                text = text.replace('«', '"').replace('»', '"')
+                # Заменяем тире на дефис
+                text = text.replace('—', '-').replace('–', '-')
+                # Заменяем многоточие на три точки
+                text = text.replace('…', '...')
+                # Экранируем амперсанд
+                text = text.replace('&', '&amp;')
+                # Буква ё поддерживается - оставляем как есть
+                # Удаляем множественные пробелы
+                text = ' '.join(text.split())
+                return text
+            
             # Проверяем, содержит ли текст уже SSML теги <speak>
             text_stripped = text.strip()
             if text_stripped.startswith('<speak>') and '</speak>' in text_stripped:
                 # Текст уже содержит SSML, используем как есть
-                ssml_text = text_stripped
-                logging.info("Текст уже содержит SSML теги, используем без изменений")
+                # Но всё равно очищаем содержимое от неподдерживаемых символов
+                import re
+                # Извлекаем содержимое между <prosody ...> и </prosody>
+                match = re.search(r'<prosody[^>]*>(.*?)</prosody>', text_stripped, re.DOTALL)
+                if match:
+                    inner_text = match.group(1)
+                    cleaned_inner = clean_xml_text(inner_text)
+                    ssml_text = text_stripped.replace(inner_text, cleaned_inner)
+                    logging.info("Текст уже содержит SSML теги, очищаем от неподдерживаемых символов")
+                else:
+                    ssml_text = text_stripped
             else:
                 # Обёртка текста в SSML для управления скоростью
-                ssml_text = f'<speak><prosody rate="{speech_rate}">{text}</prosody></speak>'
+                cleaned_text = clean_xml_text(text)
+                ssml_text = f'<speak><prosody rate="{speech_rate}">{cleaned_text}</prosody></speak>'
+            
+            # Логирование финального SSML-текста с тегами скорости и ударениями
+            logging.info(f"Генерация аудио: текст='{ssml_text[:100]}...' (длина: {len(ssml_text)}), голос='{speaker}', скорость='{speech_rate}')")
             
             # Генерация аудио с SSML
             audio = self.model.apply_tts(
