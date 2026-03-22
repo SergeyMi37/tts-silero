@@ -459,8 +459,10 @@ class TextPreprocessor:
                     chunks = self._split_text_into_chunks(text, max_chunk_size=1500)
                     processed_chunks = []
                     
+                    total_chunks = len(chunks)
+                    logger.info(f"Всего частей для обработки: {total_chunks}")
                     for i, chunk in enumerate(chunks):
-                        logger.debug(f"Обработка части {i+1}/{len(chunks)} (длина: {len(chunk)})")
+                        logger.debug(f"Обработка части {i+1}/{total_chunks} (длина: {len(chunk)})")
                         try:
                             processed_chunk = self._stress_model(chunk)
                             logger.debug(f"Часть {i+1} результат (первые 100 симв.): {processed_chunk[:100]}")

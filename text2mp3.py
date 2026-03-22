@@ -16,6 +16,7 @@ import wave
 from pydub import AudioSegment
 from text_preprocessor import TextPreprocessor
 import html
+import argparse
 
 # Константы для логирования
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
@@ -93,6 +94,7 @@ class SileroTTSApp:
         self.current_sound = None  # Для хранения текущего звукового объекта
         self.demo_text = DEFAULT_DEMO_TEXT  # Тестовый текст по умолчанию
         self.stop_generation_flag = False  # Флаг остановки генерации
+        self.last_loaded_file_path = None  # Путь к последнему загруженному файлу
         
         # Переменные настроек предобработки текста
         self.use_preprocessing_var = tk.BooleanVar(value=False)
@@ -116,6 +118,7 @@ class SileroTTSApp:
         
         self.load_config()
         self.setup_ui()
+        self.apply_saved_config()
         self.load_model_threaded()
     
     def load_config(self):
@@ -152,7 +155,9 @@ class SileroTTSApp:
                 'target_dir': self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR,
                 'use_preprocessing': bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False,
                 'use_num2words': bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True,
-                'use_ruaccent': bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
+                'use_ruaccent': bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False,
+                'last_loaded_file': self.last_loaded_file_path if hasattr(self, 'last_loaded_file_path') else None,
+                'delete_wav_dir': bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
@@ -172,13 +177,17 @@ class SileroTTSApp:
         buttons_frame = ttk.Frame(main_frame)
         buttons_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Кнопка загрузки тестового текста
-        self.load_demo_btn = ttk.Button(buttons_frame, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
-        self.load_demo_btn.pack(side=tk.RIGHT, padx=(10, 0))
-        
         # Кнопка выбора файла
         self.load_file_btn = ttk.Button(buttons_frame, text="📄 Загрузить файл (txt/fb2)", command=self.load_file)
-        self.load_file_btn.pack(side=tk.RIGHT, padx=(10, 0))
+        self.load_file_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Кнопка загрузки тестового текста
+        self.load_demo_btn = ttk.Button(buttons_frame, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
+        self.load_demo_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Кнопка генерации CLI команды
+        self.generate_cli_btn = ttk.Button(buttons_frame, text="📋 Создать CLI команду", command=self.generate_cli_command)
+        self.generate_cli_btn.pack(side=tk.LEFT, padx=(0, 10))
         
         # Вкладки
         self.notebook = ttk.Notebook(main_frame)
@@ -278,6 +287,7 @@ class SileroTTSApp:
         # Настройки конвертации в MP3
         self.convert_to_mp3_var = tk.BooleanVar(value=False)
         self.mp3_bitrate_var = tk.StringVar(value="192k")
+        self.delete_wav_dir_var = tk.BooleanVar(value=False)
         
         # Целевая директория для WAV файлов
         self.target_dir_var = tk.StringVar(value=AUDIO_DIR)
@@ -329,6 +339,15 @@ class SileroTTSApp:
         )
         self.mp3_bitrate_combo.pack(side=tk.LEFT)
         self.mp3_bitrate_combo.bind('<<ComboboxSelected>>', lambda e: self.on_chunk_settings_changed())
+        
+        # Опция удаления директории WAV после объединения и конвертации
+        self.delete_wav_dir_check = ttk.Checkbutton(
+            chunk_frame,
+            text="Удалять WAV после MP3",
+            variable=self.delete_wav_dir_var,
+            command=self.on_chunk_settings_changed
+        )
+        self.delete_wav_dir_check.pack(side=tk.LEFT, padx=(15, 0))
         
         # Целевая директория для WAV файлов
         ttk.Label(chunk_frame, text="Целевая директория:").pack(side=tk.LEFT, padx=(15, 5))
@@ -442,6 +461,8 @@ class SileroTTSApp:
                 self.convert_to_mp3_var.set(bool(self.saved_config.get('convert_to_mp3', False)))
             if hasattr(self, 'mp3_bitrate_var') and 'mp3_bitrate' in self.saved_config:
                 self.mp3_bitrate_var.set(self.saved_config.get('mp3_bitrate', '192k'))
+            if hasattr(self, 'delete_wav_dir_var'):
+                self.delete_wav_dir_var.set(bool(self.saved_config.get('delete_wav_dir', False)))
             
             # Восстановление настройки скорости
             if hasattr(self, 'speech_rate_var') and 'speech_rate' in self.saved_config:
@@ -462,6 +483,12 @@ class SileroTTSApp:
                 self.use_num2words_var.set(bool(self.saved_config.get('use_num2words', True)))
             if hasattr(self, 'use_ruaccent_var'):
                 self.use_ruaccent_var.set(bool(self.saved_config.get('use_ruaccent', False)))
+            
+            # Восстановление пути к последнему загруженному файлу
+            if hasattr(self, 'last_loaded_file_path') and 'last_loaded_file' in self.saved_config:
+                self.last_loaded_file_path = self.saved_config.get('last_loaded_file')
+                if self.last_loaded_file_path:
+                    logging.debug(f"Путь к файлу восстановлен: {self.last_loaded_file_path}")
 
             self.on_chunk_settings_changed()
             self.on_preprocessing_settings_changed()
@@ -933,6 +960,25 @@ class SileroTTSApp:
                         logging.info(f"WAV файл удалён: {full_path}")
                     except Exception as remove_error:
                         logging.warning(f"Не удалось удалить WAV файл: {remove_error}")
+                    
+                    # Удаляем директорию с частями если включена опция
+                    delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
+                    if delete_wav_dir and save_parts:
+                        logging.info(f"=== УДАЛЕНИЕ ДИРЕКТОРИИ С ЧАСТЯМИ (speak_chunks) ===")
+                        logging.info(f"  delete_wav_dir: {delete_wav_dir}")
+                        logging.info(f"  save_parts: {save_parts}")
+                        logging.info(f"  parts_dir: {parts_dir}")
+                        logging.info(f"  parts_dir существует: {os.path.exists(parts_dir)}")
+                        try:
+                            import shutil
+                            if os.path.exists(parts_dir):
+                                shutil.rmtree(parts_dir)
+                                logging.info(f"Директория с частями удалена: {parts_dir}")
+                                logging.info(f"parts_dir существует после удаления: {os.path.exists(parts_dir)}")
+                            else:
+                                logging.warning(f"Директория с частями не найдена: {parts_dir}")
+                        except Exception as del_error:
+                            logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
                 except Exception as mp3_error:
                     logging.error(f"Ошибка конвертации в MP3: {mp3_error}")
                     self.show_warning("Предупреждение", f"WAV сохранён, но конвертация в MP3 не удалась:\n{str(mp3_error)}")
@@ -1070,6 +1116,10 @@ class SileroTTSApp:
             except Exception:
                 pass
             
+            # Сохранение пути к файлу для использования в CLI команде
+            self.last_loaded_file_path = file_path
+            self.save_config()
+            
             self.update_status(f"Статус: Файл загружён: {os.path.basename(file_path)} ✅")
             logging.info(f"Текст из файла {file_path} успешно загружен в текстовое поле")
             
@@ -1097,6 +1147,104 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при загрузке тестового текста: {e}", exc_info=True)
             self.show_error("Ошибка", f"Не удалось загрузить тестовый текст: {e}")
+    
+    def generate_cli_command(self):
+        """Генерация CLI команды на основе текущих настроек"""
+        try:
+            # Получение текущих настроек
+            speaker = self.speaker_combo.get() if hasattr(self, 'speaker_combo') else 'baya'
+            speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
+            chunk_mode = bool(self.chunk_mode_var.get()) if hasattr(self, 'chunk_mode_var') else False
+            save_parts = bool(self.save_parts_var.get()) if hasattr(self, 'save_parts_var') else False
+            max_chars = int(str(self.max_chars_var.get()).strip()) if hasattr(self, 'max_chars_var') else DEFAULT_MAX_CHARS_PER_CHUNK
+            silence_ms = int(str(self.silence_ms_var.get()).strip()) if hasattr(self, 'silence_ms_var') else DEFAULT_SILENCE_MS
+            convert_to_mp3 = bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False
+            mp3_bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else '192k'
+            delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
+            use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
+            use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
+            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
+            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            
+            # Формирование базовой команды
+            cmd_parts = ['python text2mp3.py']
+            
+            # Текст или файл
+            text = self.text_area.get("1.0", tk.END).strip()
+            
+            # Проверяем, есть ли сохранённый путь к файлу (из JSON или текущей сессии)
+            file_path = None
+            if hasattr(self, 'last_loaded_file_path') and self.last_loaded_file_path:
+                file_path = self.last_loaded_file_path
+            elif hasattr(self, 'saved_config') and self.saved_config.get('last_loaded_file'):
+                file_path = self.saved_config.get('last_loaded_file')
+            
+            if file_path:
+                cmd_parts.append(f'--input-file "{file_path}"')
+            elif text:
+                # Если текст короткий, добавляем его в команду
+                if len(text) < 200:
+                    escaped_text = text.replace('"', '\\"')
+                    cmd_parts.append(f'--text "{escaped_text}"')
+                else:
+                    cmd_parts.append('--input-file <путь_к_файлу>')
+            
+            # Выходной файл
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_ext = '.mp3' if convert_to_mp3 else '.wav'
+            cmd_parts.append(f'--output output_{timestamp}{output_ext}')
+            
+            # Голос и скорость
+            if speaker != 'baya':
+                cmd_parts.append(f'--speaker {speaker}')
+            if speech_rate != 'medium':
+                cmd_parts.append(f'--speech-rate {speech_rate}')
+            
+            # Чанки
+            if chunk_mode or (text and len(text) > AUTO_CHUNK_THRESHOLD):
+                cmd_parts.append('--chunks')
+                if max_chars != DEFAULT_MAX_CHARS_PER_CHUNK:
+                    cmd_parts.append(f'--max-chars {max_chars}')
+                if silence_ms != DEFAULT_SILENCE_MS:
+                    cmd_parts.append(f'--silence-ms {silence_ms}')
+                if save_parts:
+                    cmd_parts.append('--save-parts')
+            
+            # MP3 конвертация
+            if convert_to_mp3:
+                cmd_parts.append('--mp3')
+                if mp3_bitrate != '192k':
+                    cmd_parts.append(f'--bitrate {mp3_bitrate}')
+                if delete_wav_dir:
+                    cmd_parts.append('--delete-parts')
+            
+            # Предобработка
+            if use_preprocessing:
+                cmd_parts.append('--preprocess')
+                if not use_num2words:
+                    cmd_parts.append('--no-num2words')
+                if use_ruaccent:
+                    cmd_parts.append('--ruaccent')
+            
+            # Целевая директория
+            if target_dir != AUDIO_DIR:
+                cmd_parts.append(f'--output-dir "{target_dir}"')
+            
+            # Сборка команды
+            cli_command = ' '.join(cmd_parts)
+            
+            # Показ команды
+            self.show_info("CLI команда", f"Команда для запуска из консоли:\n\n{cli_command}\n\nНажмите Ctrl+C чтобы скопировать")
+            
+            # Копирование в буфер обмена
+            self.root.clipboard_clear()
+            self.root.clipboard_append(cli_command)
+            self.update_status("Статус: CLI команда скопирована в буфер обмена ✅")
+            logging.info(f"CLI команда сгенерирована: \n\n{cli_command}\n\n")
+            
+        except Exception as e:
+            logging.error(f"Ошибка при генерации CLI команды: {e}", exc_info=True)
+            self.show_error("Ошибка", f"Не удалось создать CLI команду:\n{e}")
     
     def select_target_directory(self):
         """Выбор целевой директории для WAV файлов"""
@@ -1228,6 +1376,36 @@ class SileroTTSApp:
                 duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
                 
                 logging.info(f"MP3 файл создан: {mp3_path} (размер: {mp3_size:.2f} КБ, битрейт: {bitrate}, длительность: {duration_formatted})")
+                
+                # Удаление директории с WAV файлами если включена опция
+                delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
+                logging.info(f"=== ПРОВЕРКА ОПЦИИ УДАЛЕНИЯ WAV ===")
+                logging.info(f"  delete_wav_dir_var существует: {hasattr(self, 'delete_wav_dir_var')}")
+                logging.info(f"  Значение delete_wav_dir: {delete_wav_dir}")
+                logging.info(f"  Количество WAV файлов: {len(wav_files)}")
+                logging.info(f"  Директория: {directory}")
+                logging.info(f"  Директория существует: {os.path.exists(directory)}")
+                
+                if delete_wav_dir:
+                    logging.info(f"Опция удаления ВКЛЮЧЕНА, начинаем удаление...")
+                    if wav_files:
+                        try:
+                            import shutil
+                            logging.info(f"Удаление директории с WAV файлами: {directory}")
+                            logging.info(f"Содержимое директории перед удалением: {os.listdir(directory)}")
+                            shutil.rmtree(directory)
+                            logging.info(f"Директория успешно удалена: {directory}")
+                            logging.info(f"Директория существует после удаления: {os.path.exists(directory)}")
+                            self.update_status(f"Статус: WAV файлы удалены ✅")
+                        except Exception as del_error:
+                            logging.error(f"КРИТИЧЕСКАЯ ОШИБКА при удалении директории: {del_error}", exc_info=True)
+                            logging.error(f"Тип ошибки: {type(del_error).__name__}")
+                            self.show_warning("Предупреждение", f"MP3 создан, но не удалось удалить WAV файлы:\n{del_error}")
+                    else:
+                        logging.warning("Опция удаления включена, но wav_files пуст")
+                else:
+                    logging.info("Опция удаления WAV ВЫКЛЮЧЕНА")
+                
                 self.update_status(f"Статус: MP3 создан ✅")
                 self.show_info(
                     "Успех", 
@@ -1701,6 +1879,27 @@ class SileroTTSApp:
                             logging.info(f"WAV файл удалён: {full_path}")
                         except Exception as remove_error:
                             logging.warning(f"Не удалось удалить WAV файл: {remove_error}")
+                        
+                        # Удаляем директорию с частями если включена опция
+                        delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
+                        if delete_wav_dir and use_chunking and save_parts:
+                            parts_dir = os.path.join(target_dir, f"{base_name}_parts")
+                            logging.info(f"=== ПРОВЕРКА УДАЛЕНИЯ ДИРЕКТОРИИ С ЧАСТЯМИ ===")
+                            logging.info(f"  delete_wav_dir: {delete_wav_dir}")
+                            logging.info(f"  use_chunking: {use_chunking}")
+                            logging.info(f"  save_parts: {save_parts}")
+                            logging.info(f"  parts_dir: {parts_dir}")
+                            logging.info(f"  parts_dir существует: {os.path.exists(parts_dir)}")
+                            try:
+                                import shutil
+                                if os.path.exists(parts_dir):
+                                    shutil.rmtree(parts_dir)
+                                    logging.info(f"Директория с частями удалена: {parts_dir}")
+                                    logging.info(f"parts_dir существует после удаления: {os.path.exists(parts_dir)}")
+                                else:
+                                    logging.warning(f"Директория с частями не найдена: {parts_dir}")
+                            except Exception as del_error:
+                                logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
                     except Exception as mp3_error:
                         logging.error(f"Ошибка конвертации в MP3: {mp3_error}")
                         self.show_warning("Предупреждение", f"WAV сохранён, но конвертация в MP3 не удалась:\n{str(mp3_error)}")
@@ -1831,20 +2030,332 @@ class SileroTTSApp:
         self.root.destroy()
         logging.shutdown()
 
-def main():
-    """Главная функция запуска приложения"""
-    logging.info("=== ЗАПУСК ПРИЛОЖЕНИЯ ===")
+def run_cli(args):
+    """Запуск TTS в режиме командной строки (без GUI)"""
+    logging.info("=== ЗАПУСК В CLI РЕЖИМЕ ===")
     
     try:
-        root = tk.Tk()
-        app = SileroTTSApp(root)
-        root.mainloop()
+        # Инициализация препроцессора
+        text_preprocessor = TextPreprocessor()
+        
+        # Загрузка текста из файла или из аргумента
+        if args.input_file:
+            logging.info(f"Загрузка текста из файла: {args.input_file}")
+            import zipfile
+            import xml.etree.ElementTree as ET
+            
+            file_ext = os.path.splitext(args.input_file)[1].lower()
+            
+            if file_ext == '.zip':
+                # Поиск FB2 файла внутри ZIP архива
+                logging.info("Распаковка FB2 из ZIP архива...")
+                with zipfile.ZipFile(args.input_file, 'r') as zf:
+                    # Попытка получить имена файлов в правильной кодировке
+                    try:
+                        # Сначала пробуем UTF-8
+                        fb2_files = [f for f in zf.namelist() if f.endswith('.fb2')]
+                    except UnicodeDecodeError:
+                        # Если не получилось, используем CP866 (для кириллицы)
+                        fb2_files = [f for f in zf.namelist() if f.endswith('.fb2')]
+                    
+                    if not fb2_files:
+                        logging.error("FB2 файл не найден в ZIP архиве")
+                        print("Ошибка: FB2 файл не найден в ZIP архиве")
+                        return 1
+                    
+                    fb2_file = fb2_files[0]
+                    logging.info(f"Найден FB2 файл: {fb2_file}")
+                    
+                    # Чтение содержимого FB2 файла
+                    with zf.open(fb2_file) as f:
+                        fb2_bytes = f.read()
+                        # Пробуем UTF-8, если не получается - CP1251
+                        try:
+                            fb2_content = fb2_bytes.decode('utf-8')
+                        except UnicodeDecodeError:
+                            fb2_content = fb2_bytes.decode('cp1251')
+                
+                # Парсинг FB2 содержимого
+                root = ET.fromstring(fb2_content)
+                text_parts = []
+                for elem in root.iter():
+                    if elem.tag.endswith('p') or elem.tag.endswith('title'):
+                        if elem.text:
+                            text_parts.append(elem.text.strip())
+                text = '\n'.join(text_parts)
+                logging.info(f"Текст извлечён из FB2 в ZIP (длина: {len(text)})")
+                
+            elif file_ext == '.fb2':
+                # Парсинг FB2 файла
+                logging.info("Парсинг FB2 файла...")
+                tree = ET.parse(args.input_file)
+                root = tree.getroot()
+                
+                text_parts = []
+                for elem in root.iter():
+                    if elem.tag.endswith('p') or elem.tag.endswith('title'):
+                        if elem.text:
+                            text_parts.append(elem.text.strip())
+                text = '\n'.join(text_parts)
+                logging.info(f"Текст извлечён из FB2 (длина: {len(text)})")
+                
+            else:
+                # Чтение TXT файла
+                with open(args.input_file, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                logging.info(f"Текст загружен из TXT (длина: {len(text)})")
+        elif args.text:
+            text = args.text
+        else:
+            logging.error("Не указан текст или файл для озвучки")
+            print("Ошибка: Необходимо указать --text или --input-file")
+            return 1
+        
+        if not text.strip():
+            logging.error("Пустой текст")
+            print("Ошибка: Пустой текст")
+            return 1
+        
+        logging.info(f"Текст для озвучки: {len(text)} символов")
+        
+        # Предобработка текста если включена
+        if args.preprocess:
+            logging.info("Выполняется предобработка текста...")
+            use_ruaccent = args.ruaccent if hasattr(args, 'ruaccent') else False
+            text = text_preprocessor.preprocess(
+                text,
+                use_num2words=not args.no_num2words,
+                use_ruaccent=use_ruaccent
+            )
+            logging.info(f"Текст предобработан: {len(text)} символов")
+        
+        # Загрузка модели
+        logging.info(f"Загрузка модели TTS из: {MODEL_FILE}")
+        device = torch.device('cpu')
+        torch.set_num_threads(args.threads if hasattr(args, 'threads') else 4)
+        
+        if not os.path.exists(MODEL_FILE):
+            logging.info("Модель не найдена, начинается скачивание...")
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            torch.hub.download_url_to_file(MODEL_URL, MODEL_FILE, progress=True)
+        
+        model = torch.package.PackageImporter(MODEL_FILE).load_pickle("tts_models", "model")
+        model.to(device)
+        logging.info("Модель загружена")
+        
+        # Получение параметров
+        speaker = args.speaker if args.speaker else 'baya'
+        speech_rate = args.speech_rate if hasattr(args, 'speech_rate') else 'medium'
+        max_chars = args.max_chars if hasattr(args, 'max_chars') else DEFAULT_MAX_CHARS_PER_CHUNK
+        silence_ms = args.silence_ms if hasattr(args, 'silence_ms') else DEFAULT_SILENCE_MS
+        convert_to_mp3 = args.mp3 if hasattr(args, 'mp3') else False
+        mp3_bitrate = args.bitrate if hasattr(args, 'bitrate') else '192k'
+        
+        # Определение целевой директории
+        output_dir = args.output_dir if hasattr(args, 'output_dir') and args.output_dir else None
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            logging.info(f"Целевая директория: {output_dir}")
+        
+        # Определение выходного файла
+        output_path = args.output
+        if not output_path:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"tts_output_{timestamp}.wav"
+            output_path = os.path.join(output_dir, output_filename) if output_dir else output_filename
+        elif output_dir and not os.path.isabs(output_path):
+            output_path = os.path.join(output_dir, output_path)
+        
+        # Разбиение на чанки если текст большой или включен режим чанков
+        use_chunking = args.chunks if hasattr(args, 'chunks') else len(text) > AUTO_CHUNK_THRESHOLD
+        
+        if use_chunking:
+            logging.info(f"Режим чанков: max_chars={max_chars}, silence={silence_ms}ms")
+            chunks = text_preprocessor._split_text_into_chunks(text, max_chars)
+            logging.info(f"Текст разбит на {len(chunks)} чанков")
+            
+            # Создание директории для частей если включена опция
+            save_parts = args.save_parts if hasattr(args, 'save_parts') else False
+            parts_dir = None
+            if save_parts:
+                parts_dir = os.path.splitext(output_path)[0] + "_parts"
+                os.makedirs(parts_dir, exist_ok=True)
+                logging.info(f"Директория для частей создана: {parts_dir}")
+            
+            silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
+            silence = np.zeros((silence_samples,), dtype=np.int16) if silence_samples > 0 else None
+            
+            audio_parts = []
+            for idx, chunk_text in enumerate(chunks, start=1):
+                logging.info(f"Обработка чанка {idx}/{len(chunks)}")
+                
+                # Формирование SSML
+                chunk_escaped = html.escape(chunk_text, quote=False)
+                ssml_text = f'<speak><prosody rate="{speech_rate}">{chunk_escaped}</prosody></speak>'
+                
+                audio_tensor = model.apply_tts(
+                    ssml_text=ssml_text,
+                    speaker=speaker,
+                    sample_rate=SAMPLE_RATE,
+                    put_accent=True,
+                    put_yo=True
+                )
+                audio_int16 = (audio_tensor.numpy() * 32767).astype(np.int16)
+                if len(audio_int16.shape) == 2:
+                    audio_int16 = audio_int16[:, 0]
+                
+                # Сохранение части в файл если включена опция
+                if save_parts and parts_dir:
+                    part_path = os.path.join(parts_dir, f"part_{idx:03d}.wav")
+                    with wave.open(part_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(SAMPLE_RATE)
+                        wf.writeframes(audio_int16.tobytes())
+                    logging.debug(f"Часть {idx} сохранена: {part_path}")
+                
+                audio_parts.append(audio_int16)
+                if silence is not None and idx != len(chunks):
+                    audio_parts.append(silence)
+            
+            audio_full = np.concatenate(audio_parts)
+        else:
+            logging.info("Генерация без разбиения на чанки")
+            ssml_text = f'<speak><prosody rate="{speech_rate}">{html.escape(text, quote=False)}</prosody></speak>'
+            
+            audio_tensor = model.apply_tts(
+                ssml_text=ssml_text,
+                speaker=speaker,
+                sample_rate=SAMPLE_RATE,
+                put_accent=True,
+                put_yo=True
+            )
+            audio_full = (audio_tensor.numpy() * 32767).astype(np.int16)
+            if len(audio_full.shape) == 2:
+                audio_full = audio_full[:, 0]
+        
+        # Сохранение WAV
+        logging.info(f"Сохранение WAV: {output_path}")
+        with wave.open(output_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(audio_full.tobytes())
+        
+        wav_size = os.path.getsize(output_path) / 1024
+        logging.info(f"WAV сохранён: {output_path} ({wav_size:.2f} КБ)")
+        
+        # Конвертация в MP3 если включена
+        if convert_to_mp3:
+            logging.info(f"Конвертация в MP3 (битрейт: {mp3_bitrate})...")
+            audio = AudioSegment.from_wav(output_path)
+            mp3_path = os.path.splitext(output_path)[0] + ".mp3"
+            audio.export(mp3_path, format="mp3", bitrate=mp3_bitrate)
+            mp3_size = os.path.getsize(mp3_path) / 1024
+            logging.info(f"MP3 сохранён: {mp3_path} ({mp3_size:.2f} КБ)")
+            
+            # Удаление WAV если запрошено
+            if args.no_wav if hasattr(args, 'no_wav') else False:
+                os.remove(output_path)
+                logging.info(f"WAV удалён: {output_path}")
+                output_path = mp3_path
+            
+            # Удаление директории с частями если запрошено
+            delete_parts = args.delete_parts if hasattr(args, 'delete_parts') else False
+            if delete_parts and parts_dir and os.path.exists(parts_dir):
+                try:
+                    import shutil
+                    shutil.rmtree(parts_dir)
+                    logging.info(f"Директория с частями удалена: {parts_dir}")
+                except Exception as del_error:
+                    logging.error(f"Не удалось удалить директорию с частями: {del_error}")
+        
+        print(f"✅ Аудио сохранено: {output_path}")
+        logging.info("=== CLI режим завершен успешно ===")
+        return 0
+        
     except Exception as e:
-        logging.critical(f"Критическая ошибка при запуске приложения: {e}", exc_info=True)
-        print(f"Критическая ошибка: {e}")
-        sys.exit(1)
-    finally:
-        logging.info("=== ПРИЛОЖЕНИЕ ЗАВЕРШЕНО ===")
+        logging.error(f"Ошибка в CLI режиме: {e}", exc_info=True)
+        print(f"❌ Ошибка: {e}")
+        return 1
+
+
+def main():
+    """Главная функция запуска приложения"""
+    # Парсинг аргументов командной строки
+    parser = argparse.ArgumentParser(
+        description='Silero TTS - синтез речи из текста в MP3/WAV',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Примеры использования:
+  python text2mp3.py --text "Привет мир!" -o output.wav
+  python text2mp3.py -i input.txt -o output.mp3 --mp3
+  python text2mp3.py --text "Длинный текст..." --chunks --max-chars 1000
+  python text2mp3.py  # запуск GUI интерфейса
+        '''
+    )
+    
+    # Режим работы
+    parser.add_argument('--gui', action='store_true', help='Запуск GUI интерфейса (по умолчанию)')
+    
+    # Входные данные
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument('--text', '-t', type=str, help='Текст для озвучки')
+    input_group.add_argument('--input-file', '-i', type=str, help='Файл с текстом (txt, fb2)')
+    
+    # Выходные данные
+    parser.add_argument('--output', '-o', type=str, help='Выходной файл (WAV или MP3)')
+    parser.add_argument('--mp3', action='store_true', help='Конвертировать в MP3')
+    parser.add_argument('--bitrate', type=str, default='192k', help='Битрейт MP3 (128k, 192k, 256k, 320k)')
+    parser.add_argument('--no-wav', action='store_true', help='Удалить WAV после конвертации в MP3')
+    
+    # Параметры синтеза
+    parser.add_argument('--speaker', '-s', type=str, choices=SPEAKERS, default='baya', help='Голос диктора')
+    parser.add_argument('--speech-rate', '-r', type=str, choices=['x-slow', 'slow', 'medium', 'fast', 'x-fast'], default='medium', help='Скорость речи')
+    parser.add_argument('--threads', type=int, default=4, help='Количество потоков CPU')
+    
+    # Параметры чанков
+    parser.add_argument('--chunks', action='store_true', help='Разбивать текст на чанки')
+    parser.add_argument('--max-chars', type=int, default=DEFAULT_MAX_CHARS_PER_CHUNK, help='Макс. символов в чанке')
+    parser.add_argument('--silence-ms', type=int, default=DEFAULT_SILENCE_MS, help='Пауза между чанками (мс)')
+    parser.add_argument('--save-parts', action='store_true', help='Сохранять чанки в отдельную директорию')
+    parser.add_argument('--delete-parts', action='store_true', help='Удалить директорию с частями после конвертации в MP3')
+    parser.add_argument('--output-dir', type=str, help='Целевая директория для сохранения аудио')
+    
+    # Предобработка
+    parser.add_argument('--preprocess', action='store_true', help='Использовать предобработку текста')
+    parser.add_argument('--no-num2words', action='store_true', help='Не заменять числа словами')
+    parser.add_argument('--ruaccent', action='store_true', help='Использовать ruaccent для ударений')
+    
+    # Отладка
+    parser.add_argument('--verbose', '-v', action='store_true', help='Подробный вывод логов')
+    parser.add_argument('--quiet', '-q', action='store_true', help='Не выводить логи (только ошибки)')
+    
+    args = parser.parse_args()
+    
+    # Настройка уровня логирования
+    if args.quiet:
+        logging.getLogger().setLevel(logging.ERROR)
+    elif args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Если указан --gui или нет аргументов ввода - запускаем GUI
+    if args.gui or (not args.text and not args.input_file):
+        logging.info("=== ЗАПУСК ПРИЛОЖЕНИЯ ===")
+        
+        try:
+            root = tk.Tk()
+            app = SileroTTSApp(root)
+            root.mainloop()
+        except Exception as e:
+            logging.critical(f"Критическая ошибка при запуске приложения: {e}", exc_info=True)
+            print(f"Критическая ошибка: {e}")
+            sys.exit(1)
+        finally:
+            logging.info("=== ПРИЛОЖЕНИЕ ЗАВЕРШЕНО ===")
+    else:
+        # Запуск CLI режима
+        sys.exit(run_cli(args))
 
 if __name__ == "__main__":
     main()
