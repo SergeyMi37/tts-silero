@@ -73,6 +73,12 @@ python text2mp3.py --text "Текст" -s kseniya -r slow -o slow.wav
 # Подробный режим логирования
 python text2mp3.py -i text.txt -o result.mp3 --mp3 -v
 ```
+# Команда для запуска из консоли:
+
+```
+python text2mp3.py --input-file "D:/sbs/tts-temp-wav/Бёлль Генрих. Глазами клоуна - royallib.com.fb2.zip" --output output_20260322_211339.mp3 --speaker eugene --speech-rate slow --chunks --max-chars 600 --silence-ms 1000 --save-parts --mp3 --delete-parts --preprocess --ruaccent --output-dir "D:/sbs/tts-temp-wav"
+```
+
 
 #### Параметры CLI:
 
