@@ -181,7 +181,7 @@ python text2mp3.py -i text.txt -o result.mp3 --mp3 -v
 
 - **Модель:** `%LOCALAPPDATA%\SileroTTS\models\v5_ru.pt`
 - **Аудио по умолчанию:** `%LOCALAPPDATA%\SileroTTS\audiofiles\`
-- **Настройки:** `tts_config.json` (в папке приложения)
+- **Настройки:** `text2mp3.json` (в папке приложения)
 
 ## Требования
 

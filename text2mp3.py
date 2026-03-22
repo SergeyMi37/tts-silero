@@ -34,7 +34,7 @@ logging.basicConfig(
 SAMPLE_RATE = 48000
 MODEL_URL = 'https://models.silero.ai/models/tts/ru/v5_ru.pt'
 MODEL_NAME = 'v5_ru.pt'
-CONFIG_FILE = 'tts_config.json'
+CONFIG_FILE = 'text2mp3.json'
 
 # Путь к кэшу модели в LOCALAPPDATA
 CACHE_DIR = os.path.join(
@@ -85,7 +85,7 @@ class SileroTTSApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Silero TTS Озвучка текста (v5)")
-        self.root.geometry("600x500")
+        self.root.geometry("1200x500")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -136,13 +136,69 @@ class SileroTTSApp:
             logging.error(f"Ошибка при загрузке настроек: {e}")
             self.saved_config = {}
     
+    def add_pause_tags(self, text):
+        """Добавление тегов пауз <s> после точек в конце предложений.
+        
+        Аргументы:
+            text: Текст для обработки
+        
+        Возвращает:
+            Текст с добавленными тегами пауз после точек (валидный XML)
+        """
+        if not text:
+            return text
+        
+        # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
+        # Заменяем . на <s>.</s>, ? на <s>?</s>, ! на <s>!</s>
+        result = re.sub(r'\.\s*', '<s>.</s> ', text)
+        result = re.sub(r'\?\s*', '<s>?</s> ', result)
+        result = re.sub(r'!\s*', '<s>!</s> ', result)
+        result = re.sub(r'…\s*', '<s>…</s> ', result)
+        
+        # Удаляем множественные пробелы
+        result = ' '.join(result.split())
+        
+        logging.debug(f"Добавлены теги пауз: '{text[:50]}...' → '{result[:50]}...'")
+        return result
+    
+    def _validate_geometry(self, geometry_str):
+        """Валидация строки геометрии окна.
+        
+        Проверяет, что ширина и высота окна разумные (>= 200x150).
+        Возвращает корректную строку геометрии или значение по умолчанию.
+        """
+        try:
+            # Парсинг строки геометрии в формате "WIDTHxHEIGHT+X+Y"
+            match = re.match(r'(\d+)x(\d+)([+-]\d+)?([+-]\d+)?', geometry_str)
+            if match:
+                width = int(match.group(1))
+                height = int(match.group(2))
+                
+                # Проверяем минимальные размеры
+                if width < 200 or height < 150:
+                    logging.warning(f"Некорректная геометрия окна ({width}x{height}), используется значение по умолчанию")
+                    return '1200x500'
+                
+                # Возвращаем оригинальную строку если всё корректно
+                return geometry_str
+            else:
+                logging.warning(f"Не удалось распарсить геометрию: {geometry_str}")
+                return '1200x500'
+        except Exception as e:
+            logging.error(f"Ошибка валидации геометрии: {e}")
+            return '1200x500'
+    
     def save_config(self):
         """Сохранение настроек в JSON файл"""
         try:
+            # Получаем текущую геометрию и валидируем её
+            current_geometry = self.root.geometry() if hasattr(self, 'root') else '600x500'
+            validated_geometry = self._validate_geometry(current_geometry)
+            
             config = {
                 'speaker': self.speaker_combo.get() if hasattr(self, 'speaker_combo') else SPEAKERS[0],
                 'text': self.text_area.get("1.0", tk.END).strip() if hasattr(self, 'text_area') else '',
-                'window_geometry': self.root.geometry() if hasattr(self, 'root') else '600x500',
+                'window_geometry': validated_geometry,
                 'chunk_mode': bool(self.chunk_mode_var.get()) if hasattr(self, 'chunk_mode_var') else False,
                 'save_parts': bool(self.save_parts_var.get()) if hasattr(self, 'save_parts_var') else False,
                 'max_chars_per_chunk': int(self.max_chars_var.get()) if hasattr(self, 'max_chars_var') else DEFAULT_MAX_CHARS_PER_CHUNK,
@@ -196,13 +252,20 @@ class SileroTTSApp:
         text_tab = ttk.Frame(self.notebook)
         chunks_tab = ttk.Frame(self.notebook)
         log_tab = ttk.Frame(self.notebook)
-        self.notebook.add(text_tab, text="Текст")
-        self.notebook.add(chunks_tab, text="Кусочки")
-        self.notebook.add(log_tab, text="Протокол")
+        self.notebook.add(text_tab, text=" - Текст - ")
+        self.notebook.add(chunks_tab, text=" - Кусочки - ")
+        self.notebook.add(log_tab, text=" - Протокол - ")
 
         # --- Вкладка "Протокол" ---
         self.log_area = scrolledtext.ScrolledText(log_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.log_area.pack(fill=tk.BOTH, expand=True)
+        # Привязки клавиш для буфера обмена (только копирование, лог только для чтения)
+        self.log_area.bind('<Control-c>', lambda e: self.copy_to_clipboard(self.log_area))
+        self.log_area.bind('<Control-C>', lambda e: self.copy_to_clipboard(self.log_area))
+        # Привязки клавиш для поиска
+        self.log_area.bind('<Control-f>', lambda e: self.find_text(self.log_area))
+        self.log_area.bind('<Control-F>', lambda e: self.find_text(self.log_area))
+        self.log_area.bind('<F3>', lambda e: self.find_next(self.log_area))
 
         # --- Вкладка "Текст" ---
         ttk.Label(text_tab, text="Введите текст для озвучки:", font=("Arial", 10)).pack(anchor=tk.W, pady=(0, 5))
@@ -210,6 +273,17 @@ class SileroTTSApp:
         self.text_area = scrolledtext.ScrolledText(text_tab, wrap=tk.WORD, height=10, font=("Arial", 10))
         self.text_area.pack(fill=tk.BOTH, expand=True)
         self.text_area.insert(tk.END, DEFAULT_DEMO_TEXT)
+        # Привязки клавиш для буфера обмена
+        self.text_area.bind('<Control-c>', lambda e: self.copy_to_clipboard(self.text_area))
+        self.text_area.bind('<Control-C>', lambda e: self.copy_to_clipboard(self.text_area))
+        self.text_area.bind('<Control-v>', lambda e: self.paste_from_clipboard(self.text_area))
+        self.text_area.bind('<Control-V>', lambda e: self.paste_from_clipboard(self.text_area))
+        self.text_area.bind('<Control-x>', lambda e: self.cut_to_clipboard(self.text_area))
+        self.text_area.bind('<Control-X>', lambda e: self.cut_to_clipboard(self.text_area))
+        # Привязки клавиш для поиска
+        self.text_area.bind('<Control-f>', lambda e: self.find_text(self.text_area))
+        self.text_area.bind('<Control-F>', lambda e: self.find_text(self.text_area))
+        self.text_area.bind('<F3>', lambda e: self.find_next(self.text_area))
         logging.debug(f"Текстовое поле инициализировано с текстом по умолчанию длиной {len(DEFAULT_DEMO_TEXT)} символов")
 
         # --- Вкладка "Кусочки" ---
@@ -229,6 +303,17 @@ class SileroTTSApp:
 
         self.chunks_area = scrolledtext.ScrolledText(chunks_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.chunks_area.pack(fill=tk.BOTH, expand=True)
+        # Привязки клавиш для буфера обмена
+        self.chunks_area.bind('<Control-c>', lambda e: self.copy_to_clipboard(self.chunks_area))
+        self.chunks_area.bind('<Control-C>', lambda e: self.copy_to_clipboard(self.chunks_area))
+        self.chunks_area.bind('<Control-v>', lambda e: self.paste_from_clipboard(self.chunks_area))
+        self.chunks_area.bind('<Control-V>', lambda e: self.paste_from_clipboard(self.chunks_area))
+        self.chunks_area.bind('<Control-x>', lambda e: self.cut_to_clipboard(self.chunks_area))
+        self.chunks_area.bind('<Control-X>', lambda e: self.cut_to_clipboard(self.chunks_area))
+        # Привязки клавиш для поиска
+        self.chunks_area.bind('<Control-f>', lambda e: self.find_text(self.chunks_area))
+        self.chunks_area.bind('<Control-F>', lambda e: self.find_text(self.chunks_area))
+        self.chunks_area.bind('<F3>', lambda e: self.find_next(self.chunks_area))
         
         # Фрейм для выбора голоса и кнопок
         controls_frame = ttk.Frame(main_frame)
@@ -429,8 +514,9 @@ class SileroTTSApp:
         try:
             # Восстановление геометрии окна
             if 'window_geometry' in self.saved_config:
-                self.root.geometry(self.saved_config['window_geometry'])
-                logging.debug(f"Геометрия окна восстановлена: {self.saved_config['window_geometry']}")
+                validated_geometry = self._validate_geometry(self.saved_config['window_geometry'])
+                self.root.geometry(validated_geometry)
+                logging.debug(f"Геометрия окна восстановлена: {validated_geometry}")
             
             # Восстановление выбора голоса
             if 'speaker' in self.saved_config:
@@ -771,8 +857,11 @@ class SileroTTSApp:
                 # Это сохраняет ударения и другие специальные символы
                 chunk_text_escaped = html.escape(chunk_text, quote=False)
                 
+                # Добавляем теги пауз после точек в конце предложений
+                chunk_with_pauses = self.add_pause_tags(chunk_text_escaped)
+                
                 # Оборачиваем каждый чанк в SSML теги скорости
-                chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_text_escaped}</prosody></speak>'
+                chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
                 
                 # Логирование для отладки: финальный SSML
                 logging.debug(f"CHUNK {idx:03d} (SSML): '{chunk_with_ssml[:120]}...' (длина: {len(chunk_with_ssml)})")
@@ -1547,7 +1636,9 @@ class SileroTTSApp:
             else:
                 # Обёртка текста в SSML для управления скоростью
                 cleaned_text = clean_xml_text(text)
-                ssml_text = f'<speak><prosody rate="{speech_rate}">{cleaned_text}</prosody></speak>'
+                # Добавляем теги пауз после точек в конце предложений
+                text_with_pauses = self.add_pause_tags(cleaned_text)
+                ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
             
             # Логирование финального SSML-текста с тегами скорости и ударениями
             logging.info(f"Генерация аудио: текст='{ssml_text[:100]}...' (длина: {len(ssml_text)}), голос='{speaker}', скорость='{speech_rate}')")
@@ -1963,6 +2054,222 @@ class SileroTTSApp:
             logging.error(f"Ошибка при конвертации в MP3: {str(e)}", exc_info=True)
             raise
     
+    def show_find_dialog(self, text_widget):
+        """Показ диалога поиска"""
+        # Создаем топ-уровневое окно поиска
+        find_dialog = tk.Toplevel(self.root)
+        find_dialog.title("Поиск")
+        find_dialog.geometry("300x100")
+        find_dialog.transient(self.root)
+        find_dialog.grab_set()
+        
+        # Фрейм для элементов
+        frame = ttk.Frame(find_dialog, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Поле ввода для поиска
+        ttk.Label(frame, text="Найти:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        search_entry = ttk.Entry(frame, width=30)
+        search_entry.grid(row=0, column=1, padx=5, pady=5)
+        search_entry.focus_set()
+        
+        # Переменная для хранения последнего найденной позиции
+        search_state = {'last_pos': '1.0', 'search_text': ''}
+        
+        def do_find():
+            """Выполнение поиска"""
+            search_text = search_entry.get().strip()
+            if not search_text:
+                return
+            
+            search_state['search_text'] = search_text
+            search_state['last_pos'] = '1.0'
+            
+            # Ищем первое вхождение
+            pos = text_widget.search(search_text, '1.0', stopindex=tk.END)
+            if pos:
+                # Выделяем найденный текст
+                end_pos = f"{pos}+{len(search_text)}c"
+                text_widget.tag_remove('search', '1.0', tk.END)
+                text_widget.tag_add('search', pos, end_pos)
+                text_widget.tag_config('search', background='yellow', foreground='black')
+                text_widget.mark_set('insert', end_pos)
+                text_widget.see(pos)
+                search_state['last_pos'] = end_pos
+            else:
+                messagebox.showinfo("Поиск", "Текст не найден", parent=find_dialog)
+                search_state['last_pos'] = '1.0'
+        
+        def find_next_occurrence():
+            """Поиск следующего вхождения"""
+            search_text = search_state.get('search_text', '')
+            if not search_text:
+                # Если еще не искали, берем из поля ввода
+                search_text = search_entry.get().strip()
+                if not search_text:
+                    return
+                search_state['search_text'] = search_text
+                search_state['last_pos'] = '1.0'
+            
+            # Ищем следующее вхождение
+            pos = text_widget.search(search_text, search_state['last_pos'], stopindex=tk.END)
+            if pos:
+                # Выделяем найденный текст
+                end_pos = f"{pos}+{len(search_text)}c"
+                text_widget.tag_remove('search', '1.0', tk.END)
+                text_widget.tag_add('search', pos, end_pos)
+                text_widget.tag_config('search', background='yellow', foreground='black')
+                text_widget.mark_set('insert', end_pos)
+                text_widget.see(pos)
+                search_state['last_pos'] = end_pos
+            else:
+                # Если не найдено, начинаем с начала
+                pos = text_widget.search(search_text, '1.0', stopindex=search_state['last_pos'])
+                if pos:
+                    end_pos = f"{pos}+{len(search_text)}c"
+                    text_widget.tag_remove('search', '1.0', tk.END)
+                    text_widget.tag_add('search', pos, end_pos)
+                    text_widget.tag_config('search', background='yellow', foreground='black')
+                    text_widget.mark_set('insert', end_pos)
+                    text_widget.see(pos)
+                    search_state['last_pos'] = end_pos
+                else:
+                    messagebox.showinfo("Поиск", "Больше не найдено", parent=find_dialog)
+                    search_state['last_pos'] = '1.0'
+        
+        # Кнопки
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=1, column=0, columnspan=2, pady=10)
+        
+        ttk.Button(btn_frame, text="Найти", command=do_find).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Далее", command=find_next_occurrence).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Закрыть", command=find_dialog.destroy).pack(side=tk.LEFT, padx=5)
+        
+        # Обработка Enter в поле поиска
+        search_entry.bind('<Return>', lambda e: do_find())
+        
+        # Сохраняем ссылку на диалог для закрытия при повторном Ctrl+F
+        self._find_dialog = find_dialog
+    
+    def find_text(self, text_widget):
+        """Запуск поиска для текстового поля"""
+        # Закрываем предыдущий диалог если есть
+        if hasattr(self, '_find_dialog'):
+            try:
+                self._find_dialog.destroy()
+            except:
+                pass
+        self.show_find_dialog(text_widget)
+    
+    def find_next(self, text_widget):
+        """Поиск следующего вхождения"""
+        if hasattr(self, '_find_dialog'):
+            try:
+                # Получаем состояние поиска из диалога
+                for widget in self._find_dialog.winfo_children():
+                    if isinstance(widget, ttk.Frame):
+                        for child in widget.winfo_children():
+                            if isinstance(child, ttk.Entry):
+                                search_text = child.get().strip()
+                                if search_text:
+                                    # Ищем следующее вхождение
+                                    try:
+                                        # Получаем последнюю позицию из тега search
+                                        try:
+                                            last_pos = text_widget.tag_ranges('search')[1].string
+                                        except:
+                                            last_pos = '1.0'
+                                        
+                                        pos = text_widget.search(search_text, last_pos, stopindex=tk.END)
+                                        if pos:
+                                            end_pos = f"{pos}+{len(search_text)}c"
+                                            text_widget.tag_remove('search', '1.0', tk.END)
+                                            text_widget.tag_add('search', pos, end_pos)
+                                            text_widget.tag_config('search', background='yellow', foreground='black')
+                                            text_widget.mark_set('insert', end_pos)
+                                            text_widget.see(pos)
+                                        else:
+                                            # Начинаем с начала
+                                            pos = text_widget.search(search_text, '1.0', stopindex=last_pos)
+                                            if pos:
+                                                end_pos = f"{pos}+{len(search_text)}c"
+                                                text_widget.tag_remove('search', '1.0', tk.END)
+                                                text_widget.tag_add('search', pos, end_pos)
+                                                text_widget.tag_config('search', background='yellow', foreground='black')
+                                                text_widget.mark_set('insert', end_pos)
+                                                text_widget.see(pos)
+                                            else:
+                                                messagebox.showinfo("Поиск", "Больше не найдено")
+                                    except Exception as e:
+                                        logging.error(f"Ошибка при поиске: {e}")
+                                break
+            except Exception as e:
+                logging.error(f"Ошибка при поиске следующего: {e}")
+        else:
+            # Если диалог не открыт, показываем его
+            self.show_find_dialog(text_widget)
+    
+    def copy_to_clipboard(self, text_widget):
+        """Копирование выделенного текста в буфер обмена"""
+        try:
+            selected_text = text_widget.get("sel.first", "sel.last")
+            if selected_text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected_text)
+                self.root.update()  # Обновляем буфер обмена
+                logging.debug(f"Текст скопирован в буфер обмена ({len(selected_text)} символов)")
+            else:
+                # Если нет выделения, копируем весь текст
+                all_text = text_widget.get("1.0", tk.END).strip()
+                if all_text:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(all_text)
+                    self.root.update()
+                    logging.debug(f"Весь текст скопирован в буфер обмена ({len(all_text)} символов)")
+        except tk.TclError:
+            # Нет выделенного текста
+            pass
+        except Exception as e:
+            logging.error(f"Ошибка при копировании в буфер обмена: {e}")
+    
+    def paste_from_clipboard(self, text_widget):
+        """Вставка текста из буфера обмена"""
+        try:
+            clipboard_text = self.root.clipboard_get()
+            if clipboard_text:
+                # Вставляем в позицию курсора или заменяем выделение
+                try:
+                    # Если есть выделение, заменяем его
+                    text_widget.delete("sel.first", "sel.last")
+                except tk.TclError:
+                    # Нет выделения, вставляем в позицию курсора
+                    pass
+                text_widget.insert("insert", clipboard_text)
+                logging.debug(f"Текст вставлен из буфера обмена ({len(clipboard_text)} символов)")
+        except tk.TclError:
+            # Буфер обмена пуст или недоступен
+            pass
+        except Exception as e:
+            logging.error(f"Ошибка при вставке из буфера обмена: {e}")
+        # Возвращаем 'break' чтобы предотвратить стандартную вставку
+        return "break"
+    
+    def cut_to_clipboard(self, text_widget):
+        """Вырезание выделенного текста в буфер обмена"""
+        try:
+            selected_text = text_widget.get("sel.first", "sel.last")
+            if selected_text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected_text)
+                self.root.update()
+                text_widget.delete("sel.first", "sel.last")
+                logging.debug(f"Текст вырезан в буфер обмена ({len(selected_text)} символов)")
+        except tk.TclError:
+            # Нет выделенного текста
+            pass
+        except Exception as e:
+            logging.error(f"Ошибка при вырезании в буфер обмена: {e}")
+    
     def clear_log(self):
         """Очистка лога (информационное сообщение)"""
         logging.info("Очистка лога вызвана - логи теперь только в консоли")
@@ -2191,7 +2498,13 @@ def run_cli(args):
                 
                 # Формирование SSML
                 chunk_escaped = html.escape(chunk_text, quote=False)
-                ssml_text = f'<speak><prosody rate="{speech_rate}">{chunk_escaped}</prosody></speak>'
+                # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
+                chunk_with_pauses = re.sub(r'\.\s*', '<s>.</s> ', chunk_escaped)
+                chunk_with_pauses = re.sub(r'\?\s*', '<s>?</s> ', chunk_with_pauses)
+                chunk_with_pauses = re.sub(r'!\s*', '<s>!</s> ', chunk_with_pauses)
+                chunk_with_pauses = re.sub(r'…\s*', '<s>…</s> ', chunk_with_pauses)
+                chunk_with_pauses = ' '.join(chunk_with_pauses.split())
+                ssml_text = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
                 
                 audio_tensor = model.apply_tts(
                     ssml_text=ssml_text,
@@ -2221,7 +2534,14 @@ def run_cli(args):
             audio_full = np.concatenate(audio_parts)
         else:
             logging.info("Генерация без разбиения на чанки")
-            ssml_text = f'<speak><prosody rate="{speech_rate}">{html.escape(text, quote=False)}</prosody></speak>'
+            text_escaped = html.escape(text, quote=False)
+            # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
+            text_with_pauses = re.sub(r'\.\s*', '<s>.</s> ', text_escaped)
+            text_with_pauses = re.sub(r'\?\s*', '<s>?</s> ', text_with_pauses)
+            text_with_pauses = re.sub(r'!\s*', '<s>!</s> ', text_with_pauses)
+            text_with_pauses = re.sub(r'…\s*', '<s>…</s> ', text_with_pauses)
+            text_with_pauses = ' '.join(text_with_pauses.split())
+            ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
             
             audio_tensor = model.apply_tts(
                 ssml_text=ssml_text,
