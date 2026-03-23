@@ -84,7 +84,7 @@ class TextHandler(logging.Handler):
 class SileroTTSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Silero TTS Озвучка текста (v5)")
+        self.root.title("Озвучка текста - Silero TTS (v5)")
         self.root.geometry("1200x500")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -1240,6 +1240,9 @@ class SileroTTSApp:
     def generate_cli_command(self):
         """Генерация CLI команды на основе текущих настроек"""
         try:
+            # Сохранение всех текущих параметров в JSON перед формированием CLI команды
+            self.save_config()
+            
             # Получение текущих настроек
             speaker = self.speaker_combo.get() if hasattr(self, 'speaker_combo') else 'baya'
             speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
@@ -1323,10 +1326,11 @@ class SileroTTSApp:
             cli_command = ' '.join(cmd_parts)
             
             # Показ команды
-            self.show_info("CLI команда", f"Команда для запуска из консоли:\n\n{cli_command}\n\nНажмите Ctrl+C чтобы скопировать")
+            self.show_info("CLI команда", f"{cli_command}\n\nуже скопирована в буфер обмена")
             
             # Копирование в буфер обмена
             self.root.clipboard_clear()
+
             self.root.clipboard_append(cli_command)
             self.update_status("Статус: CLI команда скопирована в буфер обмена ✅")
             logging.info(f"CLI команда сгенерирована: \n\n{cli_command}\n\n")
