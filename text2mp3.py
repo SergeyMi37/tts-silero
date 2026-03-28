@@ -380,6 +380,9 @@ class SileroTTSApp:
         
         self.clear_chunks_btn = ttk.Button(chunks_controls, text="🗑 Очистить текст", command=self.clear_chunks)
         self.clear_chunks_btn.pack(side=tk.LEFT)
+        
+        self.merge_mp3_btn = ttk.Button(chunks_controls, text="🔗 Объединить в MP3", command=self.merge_wav_to_mp3_threaded)
+        self.merge_mp3_btn.pack(side=tk.LEFT, padx=(15, 5))
 
         self.chunks_area = scrolledtext.ScrolledText(chunks_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.chunks_area.pack(fill=tk.BOTH, expand=True)
@@ -406,10 +409,6 @@ class SileroTTSApp:
         # Кнопка сохранения
         self.save_btn = ttk.Button(controls_frame, text="💾 Сохранить (WAV/MP3)", command=self.save_audio_threaded)
         self.save_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Кнопка объединения WAV в MP3
-        self.merge_mp3_btn = ttk.Button(controls_frame, text="🔗 Объединить в MP3", command=self.merge_wav_to_mp3_threaded)
-        self.merge_mp3_btn.pack(side=tk.LEFT, padx=5)
         
         # Кнопка остановки
         self.stop_btn = ttk.Button(controls_frame, text="⏹ Остановить", command=self.stop_audio)
