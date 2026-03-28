@@ -3,6 +3,7 @@ from tkinter import ttk, scrolledtext, messagebox
 import torch
 import os
 import threading
+import time
 import pygame
 import numpy as np
 import logging
@@ -13,6 +14,7 @@ import hashlib
 import subprocess
 import re
 import wave
+import struct
 from pydub import AudioSegment
 from text_preprocessor import TextPreprocessor
 import html
@@ -23,7 +25,7 @@ LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName
 
 # Настройка логирования (только в консоль)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
         logging.StreamHandler(sys.stdout)
@@ -65,18 +67,46 @@ class TextHandler(logging.Handler):
     def __init__(self, text_widget):
         super().__init__()
         self.text_widget = text_widget
+        self.buffer = []
+        self.buffer_lock = threading.Lock()
+        self.flush_scheduled = False
+        self.max_lines = 3000
+
+    def _flush_buffer(self):
+        try:
+            with self.buffer_lock:
+                messages = self.buffer
+                self.buffer = []
+                self.flush_scheduled = False
+
+            if not messages:
+                return
+
+            self.text_widget.insert(tk.END, "\n".join(messages) + "\n")
+
+            # Ограничиваем размер лога в UI, чтобы не раздувать память
+            total_lines = int(self.text_widget.index('end-1c').split('.')[0])
+            if total_lines > self.max_lines:
+                lines_to_delete = total_lines - self.max_lines
+                self.text_widget.delete('1.0', f'{lines_to_delete + 1}.0')
+
+            self.text_widget.see(tk.END)
+        except Exception:
+            pass
     
     def emit(self, record):
         try:
             msg = self.format(record)
-            def append():
-                self.text_widget.insert(tk.END, msg + '\n')
-                self.text_widget.see(tk.END)  # Автопрокрутка к последнему сообщению
-            # Безопасный вызов в главном потоке
-            if hasattr(self.text_widget, 'after'):
-                self.text_widget.after(0, append)
-            else:
-                append()
+
+            with self.buffer_lock:
+                self.buffer.append(msg)
+                need_schedule = not self.flush_scheduled
+                if need_schedule:
+                    self.flush_scheduled = True
+
+            # Пакетная вставка лога в UI уменьшает количество after-событий
+            if need_schedule and hasattr(self.text_widget, 'after'):
+                self.text_widget.after(100, self._flush_buffer)
         except Exception:
             self.handleError(record)
 
@@ -95,6 +125,12 @@ class SileroTTSApp:
         self.demo_text = DEFAULT_DEMO_TEXT  # Тестовый текст по умолчанию
         self.stop_generation_flag = False  # Флаг остановки генерации
         self.last_loaded_file_path = None  # Путь к последнему загруженному файлу
+        self.status_update_interval = 0.15
+        self.progress_update_interval = 0.1
+        self._last_status_update_ts = 0.0
+        self._last_progress_update_ts = 0.0
+        self._pending_status_message = None
+        self._pending_progress_value = None
         
         # Переменные настроек предобработки текста
         self.use_preprocessing_var = tk.BooleanVar(value=False)
@@ -104,6 +140,7 @@ class SileroTTSApp:
         # Инициализация препроцессора текста
         self.text_preprocessor = TextPreprocessor()
         self.preprocessor_loaded = False
+        self.preprocessor_loading = False
         
         logging.info("Инициализация приложения SileroTTSApp")
         
@@ -118,8 +155,46 @@ class SileroTTSApp:
         
         self.load_config()
         self.setup_ui()
-        self.apply_saved_config()
         self.load_model_threaded()
+
+    def _ui_call(self, callback, wait=False, timeout=10.0):
+        """Безопасный вызов callback в UI-потоке Tkinter."""
+        if threading.current_thread() is threading.main_thread():
+            return callback()
+
+        if not wait:
+            self.root.after(0, callback)
+            return None
+
+        event = threading.Event()
+        result = {'value': None, 'error': None}
+
+        def wrapped():
+            try:
+                result['value'] = callback()
+            except Exception as err:
+                result['error'] = err
+            finally:
+                event.set()
+
+        self.root.after(0, wrapped)
+        if not event.wait(timeout=timeout):
+            raise TimeoutError("UI поток не ответил вовремя")
+        if result['error']:
+            raise result['error']
+        return result['value']
+
+    def _get_text_widget_content(self, widget, start="1.0", end=tk.END):
+        """Чтение содержимого Text/ScrolledText строго из UI-потока."""
+        return self._ui_call(lambda: widget.get(start, end), wait=True)
+
+    def _get_variable_value(self, variable):
+        """Чтение tk.Variable строго из UI-потока."""
+        return self._ui_call(variable.get, wait=True)
+
+    def _get_combobox_value(self, combobox):
+        """Чтение значения Combobox строго из UI-потока."""
+        return self._ui_call(combobox.get, wait=True)
     
     def load_config(self):
         """Загрузка настроек из JSON файла"""
@@ -204,8 +279,7 @@ class SileroTTSApp:
                 'max_chars_per_chunk': int(self.max_chars_var.get()) if hasattr(self, 'max_chars_var') else DEFAULT_MAX_CHARS_PER_CHUNK,
                 'silence_ms': int(self.silence_ms_var.get()) if hasattr(self, 'silence_ms_var') else DEFAULT_SILENCE_MS,
                 'chunk_dir': self.chunk_dir_var.get() if hasattr(self, 'chunk_dir_var') else 'my_audiobook',
-                'convert_to_mp3': bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False,
-                'mp3_bitrate': self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else '192k',
+                'mp3_bitrate': self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else '256k',
                 'speech_rate': self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium',
                 'demo_text': self.demo_text if hasattr(self, 'demo_text') else DEFAULT_DEMO_TEXT,
                 'target_dir': self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR,
@@ -213,7 +287,7 @@ class SileroTTSApp:
                 'use_num2words': bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True,
                 'use_ruaccent': bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False,
                 'last_loaded_file': self.last_loaded_file_path if hasattr(self, 'last_loaded_file_path') else None,
-                'delete_wav_dir': bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
+                'delete_parts_after_mp3': bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else True
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
@@ -229,34 +303,29 @@ class SileroTTSApp:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Кнопки загрузки тестового текста и файла
-        buttons_frame = ttk.Frame(main_frame)
-        buttons_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # Кнопка выбора файла
-        self.load_file_btn = ttk.Button(buttons_frame, text="📄 Загрузить файл (txt/fb2)", command=self.load_file)
-        self.load_file_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Кнопка загрузки тестового текста
-        self.load_demo_btn = ttk.Button(buttons_frame, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
-        self.load_demo_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Кнопка генерации CLI команды
-        self.generate_cli_btn = ttk.Button(buttons_frame, text="📋 Создать CLI команду", command=self.generate_cli_command)
-        self.generate_cli_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
         # Вкладки
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         text_tab = ttk.Frame(self.notebook)
         chunks_tab = ttk.Frame(self.notebook)
+        settings_tab = ttk.Frame(self.notebook)
         log_tab = ttk.Frame(self.notebook)
         self.notebook.add(text_tab, text=" - Текст - ")
         self.notebook.add(chunks_tab, text=" - Кусочки - ")
+        self.notebook.add(settings_tab, text=" - Настройки - ")
         self.notebook.add(log_tab, text=" - Протокол - ")
 
         # --- Вкладка "Протокол" ---
+        log_controls = ttk.Frame(log_tab)
+        log_controls.pack(fill=tk.X, pady=(0, 5))
+        
+        self.save_log_btn = ttk.Button(log_controls, text="💾 Сохранить в файл", command=self.save_log_to_file)
+        self.save_log_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.clear_log_btn = ttk.Button(log_controls, text="🗑 Очистить", command=self.clear_log)
+        self.clear_log_btn.pack(side=tk.LEFT, padx=5)
+        
         self.log_area = scrolledtext.ScrolledText(log_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.log_area.pack(fill=tk.BOTH, expand=True)
         # Привязки клавиш для буфера обмена (только копирование, лог только для чтения)
@@ -268,7 +337,17 @@ class SileroTTSApp:
         self.log_area.bind('<F3>', lambda e: self.find_next(self.log_area))
 
         # --- Вкладка "Текст" ---
-        ttk.Label(text_tab, text="Введите текст для озвучки:", font=("Arial", 10)).pack(anchor=tk.W, pady=(0, 5))
+        text_controls = ttk.Frame(text_tab)
+        text_controls.pack(fill=tk.X, pady=(0, 5))
+        
+        self.load_file_btn = ttk.Button(text_controls, text="📄 Загрузить файл (txt/fb2)", command=self.load_file)
+        self.load_file_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.load_demo_btn = ttk.Button(text_controls, text="📝 Загрузить тестовый текст", command=self.load_demo_text)
+        self.load_demo_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.save_text_btn = ttk.Button(text_controls, text="💾 Сохранить текст", command=self.save_text_to_file)
+        self.save_text_btn.pack(side=tk.LEFT, padx=5)
 
         self.text_area = scrolledtext.ScrolledText(text_tab, wrap=tk.WORD, height=10, font=("Arial", 10))
         self.text_area.pack(fill=tk.BOTH, expand=True)
@@ -293,13 +372,14 @@ class SileroTTSApp:
         self.split_chunks_btn = ttk.Button(chunks_controls, text="✂ Разделить текст на кусочки", command=self.split_text_to_chunks_ui)
         self.split_chunks_btn.pack(side=tk.LEFT)
 
-        self.speak_chunks_btn = ttk.Button(chunks_controls, text="🔊 Озвучивать кусочки", command=self.speak_chunks_threaded)
+        self.speak_chunks_btn = ttk.Button(chunks_controls, text="🔊 Озвучивать кусочки в файл", command=self.speak_chunks_threaded)
         self.speak_chunks_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        ttk.Label(chunks_controls, text="Имя директории:").pack(side=tk.LEFT, padx=(15, 5))
-        self.chunk_dir_var = tk.StringVar(value="my_audiobook")
-        self.chunk_dir_entry = ttk.Entry(chunks_controls, textvariable=self.chunk_dir_var, width=25)
-        self.chunk_dir_entry.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.save_chunks_btn = ttk.Button(chunks_controls, text="💾 Сохранить в файл", command=self.save_chunks_to_file)
+        self.save_chunks_btn.pack(side=tk.LEFT, padx=(15, 5))
+        
+        self.clear_chunks_btn = ttk.Button(chunks_controls, text="🗑 Очистить текст", command=self.clear_chunks)
+        self.clear_chunks_btn.pack(side=tk.LEFT)
 
         self.chunks_area = scrolledtext.ScrolledText(chunks_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.chunks_area.pack(fill=tk.BOTH, expand=True)
@@ -315,30 +395,9 @@ class SileroTTSApp:
         self.chunks_area.bind('<Control-F>', lambda e: self.find_text(self.chunks_area))
         self.chunks_area.bind('<F3>', lambda e: self.find_next(self.chunks_area))
         
-        # Фрейм для выбора голоса и кнопок
+        # Фрейм для кнопок управления (воспроизведение, сохранение, и т.д.)
         controls_frame = ttk.Frame(main_frame)
         controls_frame.pack(fill=tk.X, pady=5)
-        
-        # Выбор голоса
-        ttk.Label(controls_frame, text="Выберите голос:").pack(side=tk.LEFT, padx=(0, 10))
-        self.speaker_combo = ttk.Combobox(controls_frame, values=SPEAKERS, state="readonly", width=15)
-        self.speaker_combo.pack(side=tk.LEFT, padx=(0, 20))
-        self.speaker_combo.current(0)  # baya по умолчанию
-        logging.debug(f"Комбобокс голосов инициализирован со значениями {SPEAKERS}")
-        
-        # Настройка скорости озвучки
-        ttk.Label(controls_frame, text="Скорость:").pack(side=tk.LEFT, padx=(10, 5))
-        self.speech_rate_var = tk.StringVar(value="medium")
-        self.speech_rate_combo = ttk.Combobox(
-            controls_frame,
-            textvariable=self.speech_rate_var,
-            values=["x-slow", "slow", "medium", "fast", "x-fast"],
-            state="readonly",
-            width=10
-        )
-        self.speech_rate_combo.pack(side=tk.LEFT, padx=(0, 20))
-        self.speech_rate_combo.current(2)  # medium по умолчанию
-        logging.debug("Комбобокс скорости инициализирован")
         
         # Кнопка воспроизведения
         self.play_btn = ttk.Button(controls_frame, text="▶ Сгенерировать и воспроизвести", command=self.play_audio_threaded)
@@ -360,129 +419,202 @@ class SileroTTSApp:
         self.open_folder_btn = ttk.Button(controls_frame, text="📁 Открыть папку аудио", command=self.open_audio_folder)
         self.open_folder_btn.pack(side=tk.LEFT, padx=5)
 
-        # Настройки для больших текстов
-        chunk_frame = ttk.Frame(main_frame)
-        chunk_frame.pack(fill=tk.X, pady=(5, 0))
-
+        # === Вкладка "Настройки" ===
+        settings_canvas = tk.Canvas(settings_tab)
+        settings_scrollbar = ttk.Scrollbar(settings_tab, orient="vertical", command=settings_canvas.yview)
+        settings_scrollable_frame = ttk.Frame(settings_canvas)
+        
+        settings_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+        )
+        
+        settings_canvas.create_window((0, 0), window=settings_scrollable_frame, anchor="nw")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+        
+        settings_canvas.pack(side="left", fill="both", expand=True)
+        settings_scrollbar.pack(side="right", fill="y")
+        
+        # --- Группа 1: Основные настройки ---
+        main_settings_frame = ttk.LabelFrame(settings_scrollable_frame, text="Основные настройки", padding=10)
+        main_settings_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Выбор голоса
+        voice_frame = ttk.Frame(main_settings_frame)
+        voice_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(voice_frame, text="Выберите голос:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.speaker_combo = ttk.Combobox(voice_frame, values=SPEAKERS, state="readonly", width=20)
+        self.speaker_combo.pack(side=tk.LEFT, padx=5)
+        self.speaker_combo.current(0)  # baya по умолчанию
+        logging.debug(f"Комбобокс голосов инициализирован со значениями {SPEAKERS}")
+        
+        # Скорость речи
+        rate_frame = ttk.Frame(main_settings_frame)
+        rate_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(rate_frame, text="Скорость:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.speech_rate_var = tk.StringVar(value="medium")
+        self.speech_rate_combo = ttk.Combobox(
+            rate_frame,
+            textvariable=self.speech_rate_var,
+            values=["x-slow", "slow", "medium", "fast", "x-fast"],
+            state="readonly",
+            width=17
+        )
+        self.speech_rate_combo.pack(side=tk.LEFT, padx=5)
+        self.speech_rate_combo.current(2)  # medium по умолчанию
+        logging.debug("Комбобокс скорости инициализирован")
+        
+        # --- Группа 2: Настройки чанков ---
+        chunk_settings_frame = ttk.LabelFrame(settings_scrollable_frame, text="Настройки чанков", padding=10)
+        chunk_settings_frame.pack(fill=tk.X, padx=10, pady=5)
+        
         self.chunk_mode_var = tk.BooleanVar(value=False)
         self.save_parts_var = tk.BooleanVar(value=False)
         self.max_chars_var = tk.StringVar(value=str(DEFAULT_MAX_CHARS_PER_CHUNK))
         self.silence_ms_var = tk.StringVar(value=str(DEFAULT_SILENCE_MS))
-        
-        # Настройки конвертации в MP3
-        self.convert_to_mp3_var = tk.BooleanVar(value=False)
-        self.mp3_bitrate_var = tk.StringVar(value="192k")
-        self.delete_wav_dir_var = tk.BooleanVar(value=False)
-        
-        # Целевая директория для WAV файлов
+        self.mp3_bitrate_var = tk.StringVar(value="256k")
         self.target_dir_var = tk.StringVar(value=AUDIO_DIR)
-
+        self.delete_wav_dir_var = tk.BooleanVar(value=True)
+        
+        # Генерировать частями
+        chunk_mode_frame = ttk.Frame(chunk_settings_frame)
+        chunk_mode_frame.pack(fill=tk.X, pady=3)
         self.chunk_mode_check = ttk.Checkbutton(
-            chunk_frame,
+            chunk_mode_frame,
             text="Генерировать частями",
-            variable=self.chunk_mode_var,
-            command=self.on_chunk_settings_changed
+            variable=self.chunk_mode_var
         )
         self.chunk_mode_check.pack(side=tk.LEFT)
-
-        ttk.Label(chunk_frame, text="Макс. символов/часть:").pack(side=tk.LEFT, padx=(10, 4))
-        self.max_chars_entry = ttk.Entry(chunk_frame, textvariable=self.max_chars_var, width=6)
-        self.max_chars_entry.pack(side=tk.LEFT)
-        self.max_chars_entry.bind('<FocusOut>', lambda e: self.on_chunk_settings_changed())
-        self.max_chars_entry.bind('<Return>', lambda e: self.on_chunk_settings_changed())
-
-        ttk.Label(chunk_frame, text="Пауза, мс:").pack(side=tk.LEFT, padx=(10, 4))
-        self.silence_ms_entry = ttk.Entry(chunk_frame, textvariable=self.silence_ms_var, width=5)
-        self.silence_ms_entry.pack(side=tk.LEFT)
-        self.silence_ms_entry.bind('<FocusOut>', lambda e: self.on_chunk_settings_changed())
-        self.silence_ms_entry.bind('<Return>', lambda e: self.on_chunk_settings_changed())
-
+        
+        # Макс. символов/часть
+        max_chars_frame = ttk.Frame(chunk_settings_frame)
+        max_chars_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(max_chars_frame, text="Макс. символов/часть:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.max_chars_entry = ttk.Entry(max_chars_frame, textvariable=self.max_chars_var, width=8)
+        self.max_chars_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Пауза, мс
+        silence_frame = ttk.Frame(chunk_settings_frame)
+        silence_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(silence_frame, text="Пауза между чанками, мс:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.silence_ms_entry = ttk.Entry(silence_frame, textvariable=self.silence_ms_var, width=8)
+        self.silence_ms_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Сохранять частями (MP3)
+        save_parts_frame = ttk.Frame(chunk_settings_frame)
+        save_parts_frame.pack(fill=tk.X, pady=3)
         self.save_parts_check = ttk.Checkbutton(
-            chunk_frame,
-            text="Сохранять частями",
-            variable=self.save_parts_var,
-            command=self.on_chunk_settings_changed
+            save_parts_frame,
+            text="Сохранять частями (MP3)",
+            variable=self.save_parts_var
         )
-        self.save_parts_check.pack(side=tk.LEFT, padx=(10, 0))
+        self.save_parts_check.pack(side=tk.LEFT)
         
-        # Опция конвертации в MP3
-        self.convert_to_mp3_check = ttk.Checkbutton(
-            chunk_frame,
-            text="Конвертировать в MP3",
-            variable=self.convert_to_mp3_var,
-            command=self.on_chunk_settings_changed
-        )
-        self.convert_to_mp3_check.pack(side=tk.LEFT, padx=(10, 0))
-        
-        ttk.Label(chunk_frame, text="Битрейт:").pack(side=tk.LEFT, padx=(10, 4))
+        # Битрейт MP3
+        bitrate_frame = ttk.Frame(chunk_settings_frame)
+        bitrate_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(bitrate_frame, text="Битрейт MP3:", width=25, anchor=tk.W).pack(side=tk.LEFT)
         self.mp3_bitrate_combo = ttk.Combobox(
-            chunk_frame,
+            bitrate_frame,
             textvariable=self.mp3_bitrate_var,
             values=["128k", "192k", "256k", "320k"],
-            width=6,
+            width=7,
             state="readonly"
         )
-        self.mp3_bitrate_combo.pack(side=tk.LEFT)
-        self.mp3_bitrate_combo.bind('<<ComboboxSelected>>', lambda e: self.on_chunk_settings_changed())
+        self.mp3_bitrate_combo.pack(side=tk.LEFT, padx=5)
         
-        # Опция удаления директории WAV после объединения и конвертации
+        # Удалять части после MP3
+        delete_frame = ttk.Frame(chunk_settings_frame)
+        delete_frame.pack(fill=tk.X, pady=3)
         self.delete_wav_dir_check = ttk.Checkbutton(
-            chunk_frame,
-            text="Удалять WAV после MP3",
-            variable=self.delete_wav_dir_var,
-            command=self.on_chunk_settings_changed
+            delete_frame,
+            text="Удалять части после создания MP3",
+            variable=self.delete_wav_dir_var
         )
-        self.delete_wav_dir_check.pack(side=tk.LEFT, padx=(15, 0))
+        self.delete_wav_dir_check.pack(side=tk.LEFT)
         
-        # Целевая директория для WAV файлов
-        ttk.Label(chunk_frame, text="Целевая директория:").pack(side=tk.LEFT, padx=(15, 5))
-        self.target_dir_entry = ttk.Entry(chunk_frame, textvariable=self.target_dir_var, width=30)
-        self.target_dir_entry.pack(side=tk.LEFT, padx=(0, 5))
-        self.target_dir_btn = ttk.Button(chunk_frame, text="📁", command=self.select_target_directory)
-        self.target_dir_btn.pack(side=tk.LEFT, padx=(0, 10))
+        # Имя директории для чанков
+        chunk_dir_frame = ttk.Frame(chunk_settings_frame)
+        chunk_dir_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(chunk_dir_frame, text="Имя директории для чанков:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.chunk_dir_var = tk.StringVar(value="my_audiobook")
+        self.chunk_dir_entry = ttk.Entry(chunk_dir_frame, textvariable=self.chunk_dir_var, width=25)
+        self.chunk_dir_entry.pack(side=tk.LEFT, padx=5)
         
-        # Фрейм настроек предобработки текста
-        preprocess_frame = ttk.Frame(main_frame)
-        preprocess_frame.pack(fill=tk.X, pady=(5, 0))
+        # Целевая директория
+        target_dir_frame = ttk.Frame(chunk_settings_frame)
+        target_dir_frame.pack(fill=tk.X, pady=3)
+        ttk.Label(target_dir_frame, text="Целевая директория:", width=25, anchor=tk.W).pack(side=tk.LEFT)
+        self.target_dir_entry = ttk.Entry(target_dir_frame, textvariable=self.target_dir_var, width=30)
+        self.target_dir_entry.pack(side=tk.LEFT, padx=5)
+        self.target_dir_btn = ttk.Button(target_dir_frame, text="📁", command=self.select_target_directory)
+        self.target_dir_btn.pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(preprocess_frame, text="Предобработка текста:", font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        # --- Группа 3: Предобработка текста ---
+        preprocess_settings_frame = ttk.LabelFrame(settings_scrollable_frame, text="Предобработка текста", padding=10)
+        preprocess_settings_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        preprocess_options_frame = ttk.Frame(preprocess_frame)
-        preprocess_options_frame.pack(fill=tk.X)
+        self.use_preprocessing_var = tk.BooleanVar(value=False)
+        self.use_num2words_var = tk.BooleanVar(value=True)
+        self.use_ruaccent_var = tk.BooleanVar(value=False)
         
+        # Использовать предобработку
+        use_prep_frame = ttk.Frame(preprocess_settings_frame)
+        use_prep_frame.pack(fill=tk.X, pady=3)
         self.use_preprocessing_check = ttk.Checkbutton(
-            preprocess_options_frame,
+            use_prep_frame,
             text="Использовать предобработку текста",
-            variable=self.use_preprocessing_var,
-            command=self.on_preprocessing_settings_changed
+            variable=self.use_preprocessing_var
         )
-        self.use_preprocessing_check.pack(side=tk.LEFT, padx=(0, 15))
+        self.use_preprocessing_check.pack(side=tk.LEFT)
         
+        # Заменять числа словами
+        num2words_frame = ttk.Frame(preprocess_settings_frame)
+        num2words_frame.pack(fill=tk.X, pady=3)
         self.use_num2words_check = ttk.Checkbutton(
-            preprocess_options_frame,
+            num2words_frame,
             text="Заменять числа словами (123 → сто двадцать три)",
-            variable=self.use_num2words_var,
-            command=self.on_preprocessing_settings_changed
+            variable=self.use_num2words_var
         )
-        self.use_num2words_check.pack(side=tk.LEFT, padx=(0, 15))
+        self.use_num2words_check.pack(side=tk.LEFT)
         
+        # Доп. обработка ruaccent
+        ruaccent_frame = ttk.Frame(preprocess_settings_frame)
+        ruaccent_frame.pack(fill=tk.X, pady=3)
         self.use_ruaccent_check = ttk.Checkbutton(
-            preprocess_options_frame,
+            ruaccent_frame,
             text="Доп. обработка (ruaccent, медленнее)",
-            variable=self.use_ruaccent_var,
-            command=self.on_preprocessing_settings_changed
+            variable=self.use_ruaccent_var
         )
         self.use_ruaccent_check.pack(side=tk.LEFT)
         
         # Индикатор состояния моделей предобработки
         self.preprocessor_status_var = tk.StringVar(value="Модели предобработки: не загружены")
+        status_frame = ttk.Frame(preprocess_settings_frame)
+        status_frame.pack(fill=tk.X, pady=5)
         preprocessor_status_label = ttk.Label(
-            preprocess_options_frame, 
+            status_frame, 
             textvariable=self.preprocessor_status_var, 
             foreground="gray",
-            font=("Arial", 8)
+            font=("Arial", 9)
         )
-        preprocessor_status_label.pack(side=tk.RIGHT, padx=(10, 0))
+        preprocessor_status_label.pack(side=tk.LEFT)
+        
+        # --- Группа 4: Действия ---
+        actions_frame = ttk.LabelFrame(settings_scrollable_frame, text="Действия", padding=10)
+        actions_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Кнопка создания CLI команды
+        cli_frame = ttk.Frame(actions_frame)
+        cli_frame.pack(fill=tk.X, pady=3)
+        self.generate_cli_btn = ttk.Button(cli_frame, text="📋 Создать CLI команду", command=self.generate_cli_command)
+        self.generate_cli_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Кнопка сохранения настроек
+        save_settings_frame = ttk.Frame(actions_frame)
+        save_settings_frame.pack(fill=tk.X, pady=10)
+        self.save_settings_btn = ttk.Button(save_settings_frame, text="💾 Сохранить настройки", command=self.save_settings_from_tab)
+        self.save_settings_btn.pack(side=tk.LEFT, padx=5)
         
         # Прогресс бар
         self.progress = ttk.Progressbar(main_frame, maximum=100)
@@ -528,8 +660,11 @@ class SileroTTSApp:
             # Восстановление текста
             if 'text' in self.saved_config and self.saved_config['text']:
                 self.text_area.delete("1.0", tk.END)
-                self.text_area.insert(tk.END, self.saved_config['text'])
-                logging.debug(f"Текст восстановлен (длина: {len(self.saved_config['text'])})")
+                te = self.saved_config['text']
+                te=te.replace('^', '')
+                logging.info(f"Текст очищен от ^ {te.count('^')}")
+                self.text_area.insert(tk.END, te)
+                logging.debug(f"Текст восстановлен (длина: {len(te)})")
 
             if hasattr(self, 'chunk_mode_var'):
                 self.chunk_mode_var.set(bool(self.saved_config.get('chunk_mode', False)))
@@ -543,12 +678,10 @@ class SileroTTSApp:
                 self.chunk_dir_var.set(self.saved_config.get('chunk_dir', 'my_audiobook'))
             
             # Восстановление настроек MP3
-            if hasattr(self, 'convert_to_mp3_var'):
-                self.convert_to_mp3_var.set(bool(self.saved_config.get('convert_to_mp3', False)))
             if hasattr(self, 'mp3_bitrate_var') and 'mp3_bitrate' in self.saved_config:
-                self.mp3_bitrate_var.set(self.saved_config.get('mp3_bitrate', '192k'))
+                self.mp3_bitrate_var.set(self.saved_config.get('mp3_bitrate', '256k'))
             if hasattr(self, 'delete_wav_dir_var'):
-                self.delete_wav_dir_var.set(bool(self.saved_config.get('delete_wav_dir', False)))
+                self.delete_wav_dir_var.set(bool(self.saved_config.get('delete_parts_after_mp3', True)))
             
             # Восстановление настройки скорости
             if hasattr(self, 'speech_rate_var') and 'speech_rate' in self.saved_config:
@@ -581,23 +714,34 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при применении сохранённых настроек: {e}")
 
+    def save_settings_from_tab(self):
+        """Сохранение настроек из вкладки Настройки по кнопке"""
+        try:
+            # Обновление статуса предобработки
+            self.on_preprocessing_settings_changed(update_status_only=True)
+            # Сохранение в JSON
+            self.save_config()
+            self.update_status("Статус: Настройки сохранены ✅")
+            logging.info("Настройки сохранены пользователем через вкладку Настройки")
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении настроек: {e}")
+            self.update_status(f"Статус: Ошибка сохранения ❌ {e}")
+
     def on_chunk_settings_changed(self):
+        """Обработка изменений настроек чанков (без автоматического сохранения)"""
         try:
             self._get_chunk_settings()
         except Exception:
             return
-        try:
-            self.save_config()
-        except Exception:
-            pass
     
-    def on_preprocessing_settings_changed(self):
-        """Обработка изменений настроек предобработки текста"""
+    def on_preprocessing_settings_changed(self, update_status_only=False):
+        """Обработка изменений настроек предобработки текста (без автоматического сохранения)"""
         try:
             use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
             
-            if use_preprocessing and not self.preprocessor_loaded:
+            if use_preprocessing and not self.preprocessor_loaded and not self.preprocessor_loading:
                 # Загрузка моделей предобработки в отдельном потоке
+                self.preprocessor_loading = True
                 self.preprocessor_status_var.set("Модели предобработки: загрузка...")
                 thread = threading.Thread(target=self.load_preprocessor_models, daemon=True)
                 thread.start()
@@ -605,18 +749,17 @@ class SileroTTSApp:
                 self.preprocessor_status_var.set("Модели предобработки: загружены ✓")
             else:
                 self.preprocessor_status_var.set("Модели предобработки: не используются")
-            
-            self.save_config()
         except Exception as e:
             logging.error(f"Ошибка при изменении настроек предобработки: {e}")
     
     def load_preprocessor_models(self):
         """Загрузка моделей предобработки текста в отдельном потоке"""
         try:
-            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
+            use_ruaccent = bool(self._get_variable_value(self.use_ruaccent_var)) if hasattr(self, 'use_ruaccent_var') else False
             logging.info("Начало загрузки моделей предобработки текста")
             self.text_preprocessor.load_models(use_ruaccent=use_ruaccent)
             self.preprocessor_loaded = True
+            self.preprocessor_loading = False
             logging.info("Модели предобработки успешно загружены")
             
             # Обновление статуса в UI
@@ -624,6 +767,7 @@ class SileroTTSApp:
             self.root.after(0, lambda: self.update_status("Статус: Модели предобработки загружены ✅"))
             
         except Exception as e:
+            self.preprocessor_loading = False
             logging.error(f"Ошибка при загрузке моделей предобработки: {e}", exc_info=True)
             self.root.after(0, lambda err=e: self.preprocessor_status_var.set("Модели предобработки: ошибка загрузки"))
             self.root.after(0, lambda err=e: self.show_error("Ошибка", f"Не удалось загрузить модели предобработки:\n{err}"))
@@ -637,9 +781,9 @@ class SileroTTSApp:
         if not text:
             return text
 
-        use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-        use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-        use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
+        use_preprocessing = bool(self._get_variable_value(self.use_preprocessing_var)) if hasattr(self, 'use_preprocessing_var') else False
+        use_num2words = bool(self._get_variable_value(self.use_num2words_var)) if hasattr(self, 'use_num2words_var') else True
+        use_ruaccent = bool(self._get_variable_value(self.use_ruaccent_var)) if hasattr(self, 'use_ruaccent_var') else False
 
         processed_text = text
 
@@ -663,22 +807,22 @@ class SileroTTSApp:
         return processed_text
 
     def _get_chunk_settings(self):
-        max_chars = int(str(self.max_chars_var.get()).strip())
+        max_chars = int(str(self._get_variable_value(self.max_chars_var)).strip())
         if max_chars < 200:
             max_chars = 200
-            self.max_chars_var.set(str(max_chars))
+            self._ui_call(lambda: self.max_chars_var.set(str(max_chars)), wait=False)
 
-        silence_ms = int(str(self.silence_ms_var.get()).strip())
+        silence_ms = int(str(self._get_variable_value(self.silence_ms_var)).strip())
         if silence_ms < 0:
             silence_ms = 0
-            self.silence_ms_var.set(str(silence_ms))
+            self._ui_call(lambda: self.silence_ms_var.set(str(silence_ms)), wait=False)
 
-        chunk_mode = bool(self.chunk_mode_var.get())
-        save_parts = bool(self.save_parts_var.get())
+        chunk_mode = bool(self._get_variable_value(self.chunk_mode_var))
+        save_parts = bool(self._get_variable_value(self.save_parts_var))
         return chunk_mode, save_parts, max_chars, silence_ms
 
     def _should_use_chunking(self, text):
-        if bool(self.chunk_mode_var.get()):
+        if bool(self._get_variable_value(self.chunk_mode_var)):
             return True
         return len(text) >= AUTO_CHUNK_THRESHOLD
 
@@ -778,8 +922,8 @@ class SileroTTSApp:
         silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
         silence = np.zeros((silence_samples,), dtype=np.int16) if silence_samples > 0 else None
         
-        # Получаем текущую скорость озвучки
-        speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
+        # Получаем текущую скорость озвучки (thread-safe)
+        speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
 
         # Запускаем прогресс-бар с количеством чанков
         self.start_progress(total_chunks=len(chunks))
@@ -851,7 +995,7 @@ class SileroTTSApp:
 
             for idx, chunk_text in enumerate(chunks, start=1):
                 # Логирование для отладки: содержимое chunk_text до обработки
-                logging.debug(f"CHUNK {idx:03d} (до обработки): '{chunk_text[:100]}...' (длина: {len(chunk_text)})")
+                logging.debug(f"CHUNK {idx:06d} (до обработки): '{chunk_text[:100]}...' (длина: {len(chunk_text)})")
                 
                 # Экранируем XML-символы в chunk_text перед вставкой в SSML
                 # Это сохраняет ударения и другие специальные символы
@@ -864,11 +1008,11 @@ class SileroTTSApp:
                 chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
                 
                 # Логирование для отладки: финальный SSML
-                logging.debug(f"CHUNK {idx:03d} (SSML): '{chunk_with_ssml[:120]}...' (длина: {len(chunk_with_ssml)})")
+                logging.debug(f"CHUNK {idx:06d} (SSML): '{chunk_with_ssml[:120]}...' (длина: {len(chunk_with_ssml)})")
                 
                 self.chunks_area.insert(
                     tk.END,
-                    f"==== CHUNK {idx:03d} -> part_{idx:03d}.wav ====\n{chunk_with_ssml}\n\n"
+                    f"==== CHUNK {idx:06d} -> part_{idx:06d} ====\n{chunk_with_ssml}\n\n"
                 )
 
             self.update_status(f"Статус: Текст разделён на кусочки ({len(chunks)}) ✅")
@@ -883,17 +1027,36 @@ class SileroTTSApp:
     def _parse_chunks_from_ui(self):
         """Парсинг чанков из chunks_area (извлекает текст между ==== CHUNK ... ==== и следующим ====)"""
         try:
-            chunks_content = self.chunks_area.get("1.0", tk.END).strip()
+            chunks_content = self._get_text_widget_content(self.chunks_area).strip()
             if not chunks_content:
+                logging.info("_parse_chunks_from_ui: chunks_area пуст")
                 return []
+
+            # Слишком большой объём в текстовом виджете даёт заметные подвисания при regex-парсинге
+            if len(chunks_content) > 2_000_000:
+                logging.warning("Пропуск парсинга chunks_area: слишком большой объём текста, используем внутренний план чанков")
+                return []
+            
+            logging.info(f"_parse_chunks_from_ui: получено {len(chunks_content)} символов из chunks_area")
+            
+            # Показываем начало содержимого для отладки
+            preview = chunks_content[:200].replace('\n', '\\n')
+            logging.info(f"_parse_chunks_from_ui: начало содержимого: {preview}...")
             
             # Разделяем по маркерам CHUNK - более надёжный regex
-            # Ищем все вхождения ==== CHUNK X -> part_X.wav ====
-            chunk_markers = list(re.finditer(r'==== CHUNK (\d+) -> part_(\d+)\.wav ====', chunks_content))
+            # Ищем все вхождения ==== CHUNK X -> part_X ====
+            chunk_markers = list(re.finditer(r'==== CHUNK (\d+) -> part_(\d+) ====', chunks_content))
+            
+            logging.info(f"_parse_chunks_from_ui: найдено маркеров: {len(chunk_markers)}")
             
             if not chunk_markers:
-                logging.warning("Не найдено маркеров CHUNK в chunks_area")
-                return []
+                # Пробуем найти альтернативный маркер с .wav
+                chunk_markers = list(re.finditer(r'==== CHUNK (\d+) -> part_(\d+)\.wav ====', chunks_content))
+                if chunk_markers:
+                    logging.info(f"_parse_chunks_from_ui: найдены маркеры со старым форматом (.wav): {len(chunk_markers)}")
+                else:
+                    logging.warning("Не найдено маркеров CHUNK в chunks_area")
+                    return []
             
             parsed_chunks = []
             for i, match in enumerate(chunk_markers):
@@ -924,6 +1087,8 @@ class SileroTTSApp:
             result = [text for _, text in parsed_chunks]
             
             logging.info(f"Распарсено {len(result)} чанков из UI (найдено маркеров: {len(chunk_markers)})")
+            if result:
+                logging.info(f"_parse_chunks_from_ui: пример первого чанка: {result[0][:100]}...")
             return result
         except Exception as e:
             logging.error(f"Ошибка при парсинге чанков из UI: {e}", exc_info=True)
@@ -939,7 +1104,7 @@ class SileroTTSApp:
     def speak_chunks(self):
         try:
             chunks = None
-            chunks_source = None
+            chunks_source = ""
             
             # 1. Сначала пытаемся получить чанки из UI (chunks_area) - там уже полные SSML-теги
             if hasattr(self, 'chunks_area'):
@@ -956,7 +1121,7 @@ class SileroTTSApp:
             
             # 3. Если чанков нет, разбиваем текст заново
             if not chunks:
-                text = self.text_area.get("1.0", tk.END).strip()
+                text = self._get_text_widget_content(self.text_area).strip()
                 if not text:
                     self.show_warning("Внимание", "Введите текст для озвучки")
                     return
@@ -971,8 +1136,20 @@ class SileroTTSApp:
                 self.show_warning("Внимание", "Не удалось получить кусочки")
                 return
 
-            speaker = self.speaker_combo.get()
+            speaker = self._get_combobox_value(self.speaker_combo)
             chunk_mode, save_parts, max_chars, silence_ms = self._get_chunk_settings()
+            speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
+            
+            # Всегда используем MP3 concat (Вариант 2)
+            use_wav_streaming = False
+            logging.info(f"Используем MP3 concat ({len(chunks)} чанков)")
+            
+            # Импорт модулей (нужны для обоих вариантов)
+            import subprocess
+            import tempfile
+            
+            # Вычисление количества сэмплов для паузы
+            silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
             
             # Сброс флага остановки перед началом генерации
             self.reset_stop_flag()
@@ -981,7 +1158,7 @@ class SileroTTSApp:
             self.start_progress()
 
             # Получение целевой директории
-            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            target_dir = self._get_variable_value(self.target_dir_var) if hasattr(self, 'target_dir_var') else AUDIO_DIR
             
             # Создание директории для аудио, если не существует
             if not os.path.exists(target_dir):
@@ -989,98 +1166,232 @@ class SileroTTSApp:
                 logging.info(f"Создана директория для аудио: {target_dir}")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            custom_dir = self.chunk_dir_var.get().strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
+            custom_dir = self._get_variable_value(self.chunk_dir_var).strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
             if not custom_dir:
                 custom_dir = "my_audiobook"
             base_name = f"{custom_dir}_{timestamp}"
             full_path = os.path.join(target_dir, f"{base_name}.wav")
-            parts_dir = os.path.join(target_dir, f"{base_name}_parts")
-            if save_parts:
-                os.makedirs(parts_dir, exist_ok=True)
 
-            silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
-            silence = np.zeros((silence_samples,), dtype=np.int16) if silence_samples > 0 else None
+            # Всегда сохраняем в MP3 напрямую через pydub
+            bitrate = self._get_variable_value(self.mp3_bitrate_var) if hasattr(self, 'mp3_bitrate_var') else "256k"
             
-            # Получаем текущую скорость озвучки
-            speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
-
-            # Запускаем прогресс-бар с количеством чанков
-            self.start_progress(total_chunks=len(chunks))
-
-            audio_parts = []
-            for idx, chunk_text in enumerate(chunks, start=1):
-                # Проверка флага остановки
-                self.check_stop_flag()
+            # Подсчет общей длительности (вместо накопления combined_audio в памяти)
+            total_duration = 0.0
+            
+            # Всегда сохраняем части для ffmpeg concat (независимо от save_parts)
+            parts_dir = os.path.join(target_dir, f"{base_name}_parts")
+            os.makedirs(parts_dir, exist_ok=True)
+            
+            if use_wav_streaming:
+                # === ВАРИАНТ 1: Потоковая запись WAV → ffmpeg конвертация ===
+                logging.info(f"Вариант 1: Потоковая запись WAV → ffmpeg конвертация ({len(chunks)} чанков)")
                 
-                self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                # Временный WAV файл для потоковой записи
+                temp_wav_path = os.path.join(parts_dir, "temp_full.wav")
                 
-                # При использовании чанков из UI, передаём в generate_audio() уже готовый SSML-текст
-                # generate_audio() сам распознает SSML теги и использует их без дополнительной обёртки
-                audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
-                audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
-
-                if save_parts:
-                    part_path = os.path.join(parts_dir, f"part_{idx:03d}.wav")
-                    self._write_wav_int16_mono(part_path, audio_int16)
-
-                audio_parts.append(audio_int16)
-                if silence is not None and idx != len(chunks):
-                    audio_parts.append(silence)
+                # Устанавливаем прогресс-бар: генерация + конвертация
+                self.start_progress(total_chunks=len(chunks) * 2)
                 
-                # Обновляем прогресс-бар
-                self.update_progress(idx)
+                # Потоковая запись в WAV
+                with wave.open(temp_wav_path, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(SAMPLE_RATE)
+                    
+                    for idx, chunk_text in enumerate(chunks, start=1):
+                        # Проверка флага остановки
+                        self.check_stop_flag()
+                        
+                        self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                        
+                        # Генерация аудио
+                        audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
+                        audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
+                        
+                        # Прямая запись в WAV (без накопления в RAM)
+                        wav_file.writeframes(audio_int16.tobytes())
+                        
+                        # Подсчет длительности
+                        audio_duration = len(audio_int16) / SAMPLE_RATE
+                        total_duration += audio_duration
+                        
+                        # Добавление паузы если нужно
+                        if silence_samples > 0 and idx != len(chunks):
+                            silence_samples_array = np.zeros(silence_samples, dtype=np.int16)
+                            wav_file.writeframes(silence_samples_array.tobytes())
+                            total_duration += silence_ms / 1000.0
+                        
+                        # Обновляем прогресс-бар
+                        self.update_progress(idx)
+                
+                # Конвертация WAV → MP3 через ffmpeg
+                mp3_path = os.path.join(target_dir, f"{base_name}.mp3")
+                self.update_status(f"Статус: Конвертация WAV → MP3...")
+                logging.info(f"Конвертация в MP3: {mp3_path} (битрейт: {bitrate})")
+                
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-i', temp_wav_path,
+                    '-b:a', bitrate,
+                    '-ar', str(SAMPLE_RATE),
+                    mp3_path
+                ], check=True, capture_output=True)
+                
+                logging.info(f"MP3 создан через ffmpeg конвертацию: {mp3_path}")
+                
+                # Удаление временного WAV
+                if os.path.exists(temp_wav_path):
+                    os.remove(temp_wav_path)
+                    logging.debug(f"Временный WAV удален: {temp_wav_path}")
+                
+                # Обновляем прогресс-бар до конца
+                self.update_progress(len(chunks) * 2)
+                
+            else:
+                # === ВАРИАНТ 2: Прямая MP3 запись → ffmpeg concat ===
+                logging.info(f"Вариант 2: Прямая MP3 запись → ffmpeg concat ({len(chunks)} чанков)")
+                
+                # Устанавливаем прогресс-бар: генерация + конвертация
+                self.start_progress(total_chunks=len(chunks) * 2)
+                
+                # Создаем тишину как AudioSegment
+                silence_segment = None
+                if silence_samples > 0:
+                    silence_segment = AudioSegment(
+                        np.zeros((silence_samples,), dtype=np.int16).tobytes(),
+                        frame_rate=SAMPLE_RATE,
+                        sample_width=2,
+                        channels=1
+                    )
+                
+                for idx, chunk_text in enumerate(chunks, start=1):
+                    # Проверка флага остановки
+                    self.check_stop_flag()
+                    
+                    self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                    
+                    # Генерация аудио
+                    audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
+                    audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
+                    
+                    # Преобразование в AudioSegment
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=SAMPLE_RATE,
+                        sample_width=2,
+                        channels=1
+                    )
+                    
+                    # Подсчет длительности
+                    total_duration += audio_segment.duration_seconds
+                    
+                    # Сохраняем часть (всегда для ffmpeg concat)
+                    part_path = os.path.join(parts_dir, f"part_{idx:06d}.mp3")
+                    audio_segment.export(part_path, format="mp3", bitrate=bitrate)
+                    logging.info(f"Часть сохранена: {part_path}")
+                    
+                    # Добавляем паузу если нужно (сохраняем как отдельную тишину)
+                    if silence_segment is not None and idx != len(chunks):
+                        silence_path = os.path.join(parts_dir, f"part_{idx:06d}_silence.mp3")
+                        silence_segment.export(silence_path, format="mp3", bitrate=bitrate)
+                        logging.info(f"Пауза сохранена: {silence_path}")
+                    
+                    # Обновляем прогресс-бар
+                    self.update_progress(idx)
+                
+                # Экспорт итогового MP3 через ffmpeg concat
+                mp3_path = os.path.join(target_dir, f"{base_name}.mp3")
+                self.update_status(f"Статус: Сборка и экспорт в MP3...")
+                logging.info(f"Экспорт в MP3: {mp3_path} (битрейт: {bitrate})")
 
-            audio_full_int16 = np.concatenate(audio_parts) if audio_parts else np.zeros((0,), dtype=np.int16)
-            self._write_wav_int16_mono(full_path, audio_full_int16)
+                # Сборка всех MP3 частей (основные + паузы) через ffmpeg concat
+                # Сортировка по числовому номеру чанка (не лексикографическая!)
+                def sort_key(path):
+                    import re
+                    filename = os.path.basename(path)
+                    match = re.match(r'part_(\d+)(?:_silence)?', filename)
+                    if match:
+                        return int(match.group(1))
+                    return 0
 
-            # Конвертация в MP3 если включена опция
-            convert_to_mp3 = bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False
-            mp3_path = None
-            if convert_to_mp3:
-                self.update_status(f"Статус: Конвертация в MP3...")
-                bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else "192k"
+                part_files = sorted([
+                    os.path.join(parts_dir, f)
+                    for f in os.listdir(parts_dir)
+                    if f.lower().endswith('.mp3')
+                ], key=sort_key)
+
+                logging.info(f"=== DEBUG CONCAT: найдено {len(part_files)} файлов для объединения ===")
+                for pf in part_files:
+                    logging.info(f"  CONCAT FILE: {pf}")
+                logging.info(f"=== END DEBUG ===")
+
+                if not part_files:
+                    raise Exception("Не найдены MP3 части для сборки итогового файла")
+
+                concat_list_path = tempfile.NamedTemporaryFile(delete=False, suffix='.txt').name
                 try:
-                    mp3_path = self.convert_wav_to_mp3(full_path, bitrate)
-                    logging.info(f"MP3 файл создан: {mp3_path}")
-                    
-                    # Удаляем WAV файл после успешной конвертации в MP3
-                    try:
-                        os.remove(full_path)
-                        logging.info(f"WAV файл удалён: {full_path}")
-                    except Exception as remove_error:
-                        logging.warning(f"Не удалось удалить WAV файл: {remove_error}")
-                    
-                    # Удаляем директорию с частями если включена опция
-                    delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
-                    if delete_wav_dir and save_parts:
-                        logging.info(f"=== УДАЛЕНИЕ ДИРЕКТОРИИ С ЧАСТЯМИ (speak_chunks) ===")
-                        logging.info(f"  delete_wav_dir: {delete_wav_dir}")
-                        logging.info(f"  save_parts: {save_parts}")
-                        logging.info(f"  parts_dir: {parts_dir}")
-                        logging.info(f"  parts_dir существует: {os.path.exists(parts_dir)}")
+                    with open(concat_list_path, 'w', encoding='utf-8') as f:
+                        for part in part_files:
+                            escaped = part.replace("'", "'\\''")
+                            f.write(f"file '{escaped}'\n")
+
+                    subprocess.run([
+                        'ffmpeg', '-y',
+                        '-f', 'concat',
+                        '-safe', '0',
+                        '-i', concat_list_path,
+                        '-c', 'copy',
+                        mp3_path
+                    ], check=True, capture_output=True)
+
+                    logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+                except subprocess.CalledProcessError as ffmpeg_err:
+                    logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
+                    raise
+                finally:
+                    if os.path.exists(concat_list_path):
                         try:
-                            import shutil
-                            if os.path.exists(parts_dir):
-                                shutil.rmtree(parts_dir)
-                                logging.info(f"Директория с частями удалена: {parts_dir}")
-                                logging.info(f"parts_dir существует после удаления: {os.path.exists(parts_dir)}")
-                            else:
-                                logging.warning(f"Директория с частями не найдена: {parts_dir}")
-                        except Exception as del_error:
-                            logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
-                except Exception as mp3_error:
-                    logging.error(f"Ошибка конвертации в MP3: {mp3_error}")
-                    self.show_warning("Предупреждение", f"WAV сохранён, но конвертация в MP3 не удалась:\n{str(mp3_error)}")
+                            os.remove(concat_list_path)
+                        except OSError:
+                            pass
+            
+            if os.path.exists(mp3_path):
+                mp3_size = os.path.getsize(mp3_path) / 1024
+                duration_hours = int(total_duration // 3600)
+                duration_minutes = int((total_duration % 3600) // 60)
+                duration_secs_remaining = int(total_duration % 60)
+                duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
+                logging.info(f"MP3 файл создан: {mp3_path} (размер: {mp3_size:.2f} КБ, битрейт: {bitrate}, длительность: {duration_formatted})")
+            
+            # Удаляем директорию с частями если включена опция
+            delete_parts = bool(self._get_variable_value(self.delete_wav_dir_var)) if hasattr(self, 'delete_wav_dir_var') else True
+            if delete_parts:
+                logging.info(f"=== УДАЛЕНИЕ ДИРЕКТОРИИ С ЧАСТЯМИ (speak_chunks) ===")
+                try:
+                    import shutil
+                    if os.path.exists(parts_dir):
+                        shutil.rmtree(parts_dir)
+                        logging.info(f"Директория с частями удалена: {parts_dir}")
+                except Exception as del_error:
+                    logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
+            
+            self.update_progress(len(chunks) * 2)
+            
+            # Показ сообщения об успехе
+            mp3_size = os.path.getsize(mp3_path) / 1024
+            duration_hours = int(total_duration // 3600)
+            duration_minutes = int((total_duration % 3600) // 60)
+            duration_secs_remaining = int(total_duration % 60)
+            duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
             
             self.update_status(f"Статус: Сохранено (кусочки) ✅")
-            if mp3_path:
-                mp3_size = os.path.getsize(mp3_path) / 1024
-                extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
-                message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\nРазмер: {mp3_size:.2f} КБ, битрейт: {bitrate}{extra}"
-            else:
-                wav_size = os.path.getsize(full_path) / 1024
-                extra = f"\n\nЧасти: {parts_dir}" if save_parts else ""
-                message = f"Аудио сохранено в файл:\n{full_path}\n\nРазмер: {wav_size:.2f} КБ{extra}"
+            extra = ""
+            if not delete_parts:
+                extra = f"\n\nЧасти: {parts_dir}"
+            message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\n"
+            message += f"Размер: {mp3_size:.2f} КБ\n"
+            message += f"Битрейт: {bitrate}\n"
+            message += f"Длительность: {duration_formatted} ({total_duration:.1f} сек){extra}"
             self.show_info("Успех", message)
             self.stop_progress()
             
@@ -1151,8 +1462,7 @@ class SileroTTSApp:
             import zipfile
             
             filetypes = [
-                ('Текстовые файлы', '*.txt;*.md'),
-                ('FB2 файлы', '*.fb2'),
+                ('Текстовые файлы', '*.txt;*.md;*.fb2'),
                 ('ZIP архивы с FB2', '*.zip'),
                 ('Все файлы', '*.*')
             ]
@@ -1197,6 +1507,8 @@ class SileroTTSApp:
             
             # Вставка текста в текстовое поле
             self.text_area.delete("1.0", tk.END)
+            text=text.replace('^', '')
+            logging.info(f"Текст очищен от ^ {text.count('^')}")
             self.text_area.insert(tk.END, text)
 
             try:
@@ -1243,26 +1555,26 @@ class SileroTTSApp:
             # Сохранение всех текущих параметров в JSON перед формированием CLI команды
             self.save_config()
             
-            # Получение текущих настроек
-            speaker = self.speaker_combo.get() if hasattr(self, 'speaker_combo') else 'baya'
-            speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
-            chunk_mode = bool(self.chunk_mode_var.get()) if hasattr(self, 'chunk_mode_var') else False
-            save_parts = bool(self.save_parts_var.get()) if hasattr(self, 'save_parts_var') else False
-            max_chars = int(str(self.max_chars_var.get()).strip()) if hasattr(self, 'max_chars_var') else DEFAULT_MAX_CHARS_PER_CHUNK
-            silence_ms = int(str(self.silence_ms_var.get()).strip()) if hasattr(self, 'silence_ms_var') else DEFAULT_SILENCE_MS
-            convert_to_mp3 = bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False
-            mp3_bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else '192k'
-            delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
-            use_preprocessing = bool(self.use_preprocessing_var.get()) if hasattr(self, 'use_preprocessing_var') else False
-            use_num2words = bool(self.use_num2words_var.get()) if hasattr(self, 'use_num2words_var') else True
-            use_ruaccent = bool(self.use_ruaccent_var.get()) if hasattr(self, 'use_ruaccent_var') else False
-            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            # Получение текущих настроек (thread-safe)
+            speaker = self._get_combobox_value(self.speaker_combo) if hasattr(self, 'speaker_combo') else 'baya'
+            speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
+            chunk_mode = bool(self._get_variable_value(self.chunk_mode_var)) if hasattr(self, 'chunk_mode_var') else False
+            save_parts = bool(self._get_variable_value(self.save_parts_var)) if hasattr(self, 'save_parts_var') else False
+            max_chars = int(str(self._get_variable_value(self.max_chars_var)).strip()) if hasattr(self, 'max_chars_var') else DEFAULT_MAX_CHARS_PER_CHUNK
+            silence_ms = int(str(self._get_variable_value(self.silence_ms_var)).strip()) if hasattr(self, 'silence_ms_var') else DEFAULT_SILENCE_MS
+            convert_to_mp3 = bool(self._get_variable_value(self.convert_to_mp3_var)) if hasattr(self, 'convert_to_mp3_var') else False
+            mp3_bitrate = self._get_variable_value(self.mp3_bitrate_var) if hasattr(self, 'mp3_bitrate_var') else '192k'
+            delete_wav_dir = bool(self._get_variable_value(self.delete_wav_dir_var)) if hasattr(self, 'delete_wav_dir_var') else False
+            use_preprocessing = bool(self._get_variable_value(self.use_preprocessing_var)) if hasattr(self, 'use_preprocessing_var') else False
+            use_num2words = bool(self._get_variable_value(self.use_num2words_var)) if hasattr(self, 'use_num2words_var') else True
+            use_ruaccent = bool(self._get_variable_value(self.use_ruaccent_var)) if hasattr(self, 'use_ruaccent_var') else False
+            target_dir = self._get_variable_value(self.target_dir_var) if hasattr(self, 'target_dir_var') else AUDIO_DIR
             
             # Формирование базовой команды
             cmd_parts = ['python text2mp3.py']
             
             # Текст или файл
-            text = self.text_area.get("1.0", tk.END).strip()
+            text = self._get_text_widget_content(self.text_area).strip()
             
             # Проверяем, есть ли сохранённый путь к файлу (из JSON или текущей сессии)
             file_path = None
@@ -1325,13 +1637,10 @@ class SileroTTSApp:
             # Сборка команды
             cli_command = ' '.join(cmd_parts)
             
-            # Показ команды
-            self.show_info("CLI команда", f"{cli_command}\n\nуже скопирована в буфер обмена")
-            
             # Копирование в буфер обмена
             self.root.clipboard_clear()
-
             self.root.clipboard_append(cli_command)
+            
             self.update_status("Статус: CLI команда скопирована в буфер обмена ✅")
             logging.info(f"CLI команда сгенерирована: \n\n{cli_command}\n\n")
             
@@ -1391,51 +1700,51 @@ class SileroTTSApp:
             self.show_error("Ошибка", f"Не удалось выбрать директорию: {e}")
     
     def merge_wav_to_mp3(self, directory):
-        """Объединение WAV файлов из директории в один MP3 файл"""
+        """Объединение MP3 файлов из директории в один MP3 файл"""
         try:
             self.reset_stop_flag()
             
-            logging.info(f"=== Начало объединения WAV в MP3 из: {directory} ===")
-            self.update_status("Статус: Поиск WAV файлов...")
+            logging.info(f"=== Начало объединения MP3 из: {directory} ===")
+            self.update_status("Статус: Поиск MP3 файлов...")
             
-            # Поиск всех WAV файлов в директории
-            wav_files = sorted([
+            # Поиск всех MP3 файлов в директории
+            mp3_files = sorted([
                 os.path.join(directory, f) 
                 for f in os.listdir(directory) 
-                if f.lower().endswith('.wav') and not f.startswith('~')
+                if f.lower().endswith('.mp3') and not f.startswith('~')
             ])
             
-            if not wav_files:
-                self.show_warning("Внимание", f"В директории не найдено WAV файлов:\n{directory}")
-                self.update_status("Статус: WAV файлы не найдены")
+            if not mp3_files:
+                self.show_warning("Внимание", f"В директории не найдено MP3 файлов:\n{directory}")
+                self.update_status("Статус: MP3 файлы не найдены")
                 return
             
-            logging.info(f"Найдено WAV файлов: {len(wav_files)}")
-            self.update_status(f"Статус: Найдено {len(wav_files)} WAV файлов")
+            logging.info(f"Найдено MP3 файлов: {len(mp3_files)}")
+            self.update_status(f"Статус: Найдено {len(mp3_files)} MP3 файлов")
             
             # Запуск прогресс-бара
-            self.start_progress(total_chunks=len(wav_files))
+            self.start_progress(total_chunks=len(mp3_files))
             
             # Загрузка и объединение аудио
             audio_parts = []
-            for idx, wav_path in enumerate(wav_files, start=1):
+            for idx, mp3_path in enumerate(mp3_files, start=1):
                 # Проверка флага остановки
                 self.check_stop_flag()
                 
-                self.update_status(f"Статус: Обработка {idx}/{len(wav_files)}...")
-                logging.info(f"Загрузка WAV: {wav_path} ({idx}/{len(wav_files)})")
+                self.update_status(f"Статус: Обработка {idx}/{len(mp3_files)}...")
+                logging.info(f"Загрузка MP3: {mp3_path} ({idx}/{len(mp3_files)})")
                 
                 try:
-                    audio = AudioSegment.from_wav(wav_path)
+                    audio = AudioSegment.from_mp3(mp3_path)
                     audio_parts.append(audio)
                 except Exception as e:
-                    logging.warning(f"Не удалось загрузить {wav_path}: {e}")
+                    logging.warning(f"Не удалось загрузить {mp3_path}: {e}")
                 
                 # Обновление прогресс-бара
                 self.update_progress(idx)
             
             if not audio_parts:
-                self.show_error("Ошибка", "Не удалось загрузить ни один WAV файл")
+                self.show_error("Ошибка", "Не удалось загрузить ни один MP3 файл")
                 self.update_status("Статус: Ошибка объединения")
                 self.stop_progress()
                 return
@@ -1447,20 +1756,20 @@ class SileroTTSApp:
             for audio in audio_parts[1:]:
                 combined_audio += audio
             
-            # Получение битрейта из настроек
-            bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else "192k"
+            # Получение битрейта из настроек (thread-safe)
+            bitrate = self._get_variable_value(self.mp3_bitrate_var) if hasattr(self, 'mp3_bitrate_var') else "192k"
             
             # Создание MP3 файла
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            mp3_path = os.path.join(directory, f"combined_{timestamp}.mp3")
+            output_mp3_path = os.path.join(directory, f"combined_{timestamp}.mp3")
             
-            self.update_status(f"Статус: Конвертация в MP3 (битрейт: {bitrate})...")
-            logging.info(f"Экспорт в MP3: {mp3_path} (битрейт: {bitrate})")
+            self.update_status(f"Статус: Сохранение MP3 (битрейт: {bitrate})...")
+            logging.info(f"Экспорт в MP3: {output_mp3_path} (битрейт: {bitrate})")
             
-            combined_audio.export(mp3_path, format="mp3", bitrate=bitrate)
+            combined_audio.export(output_mp3_path, format="mp3", bitrate=bitrate)
             
-            if os.path.exists(mp3_path):
-                mp3_size = os.path.getsize(mp3_path) / 1024
+            if os.path.exists(output_mp3_path):
+                mp3_size = os.path.getsize(output_mp3_path) / 1024
                 # Расчёт длительности аудио в секундах
                 duration_seconds = len(combined_audio) / 1000.0  # pydub использует миллисекунды
                 duration_hours = int(duration_seconds // 3600)
@@ -1468,41 +1777,41 @@ class SileroTTSApp:
                 duration_secs_remaining = int(duration_seconds % 60)
                 duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
                 
-                logging.info(f"MP3 файл создан: {mp3_path} (размер: {mp3_size:.2f} КБ, битрейт: {bitrate}, длительность: {duration_formatted})")
+                logging.info(f"MP3 файл создан: {output_mp3_path} (размер: {mp3_size:.2f} КБ, битрейт: {bitrate}, длительность: {duration_formatted})")
                 
-                # Удаление директории с WAV файлами если включена опция
-                delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
-                logging.info(f"=== ПРОВЕРКА ОПЦИИ УДАЛЕНИЯ WAV ===")
+                # Удаление директории с MP3 файлами если включена опция
+                delete_mp3_dir = bool(self._get_variable_value(self.delete_wav_dir_var)) if hasattr(self, 'delete_wav_dir_var') else False
+                logging.info(f"=== ПРОВЕРКА ОПЦИИ УДАЛЕНИЯ MP3 ===")
                 logging.info(f"  delete_wav_dir_var существует: {hasattr(self, 'delete_wav_dir_var')}")
-                logging.info(f"  Значение delete_wav_dir: {delete_wav_dir}")
-                logging.info(f"  Количество WAV файлов: {len(wav_files)}")
+                logging.info(f"  Значение delete_mp3_dir: {delete_mp3_dir}")
+                logging.info(f"  Количество MP3 файлов: {len(mp3_files)}")
                 logging.info(f"  Директория: {directory}")
                 logging.info(f"  Директория существует: {os.path.exists(directory)}")
                 
-                if delete_wav_dir:
+                if delete_mp3_dir:
                     logging.info(f"Опция удаления ВКЛЮЧЕНА, начинаем удаление...")
-                    if wav_files:
+                    if mp3_files:
                         try:
                             import shutil
-                            logging.info(f"Удаление директории с WAV файлами: {directory}")
+                            logging.info(f"Удаление директории с MP3 файлами: {directory}")
                             logging.info(f"Содержимое директории перед удалением: {os.listdir(directory)}")
                             shutil.rmtree(directory)
                             logging.info(f"Директория успешно удалена: {directory}")
                             logging.info(f"Директория существует после удаления: {os.path.exists(directory)}")
-                            self.update_status(f"Статус: WAV файлы удалены ✅")
+                            self.update_status(f"Статус: MP3 файлы удалены ✅")
                         except Exception as del_error:
                             logging.error(f"КРИТИЧЕСКАЯ ОШИБКА при удалении директории: {del_error}", exc_info=True)
                             logging.error(f"Тип ошибки: {type(del_error).__name__}")
-                            self.show_warning("Предупреждение", f"MP3 создан, но не удалось удалить WAV файлы:\n{del_error}")
+                            self.show_warning("Предупреждение", f"MP3 создан, но не удалось удалить MP3 файлы:\n{del_error}")
                     else:
-                        logging.warning("Опция удаления включена, но wav_files пуст")
+                        logging.warning("Опция удаления включена, но mp3_files пуст")
                 else:
-                    logging.info("Опция удаления WAV ВЫКЛЮЧЕНА")
+                    logging.info("Опция удаления MP3 ВЫКЛЮЧЕНА")
                 
                 self.update_status(f"Статус: MP3 создан ✅")
                 self.show_info(
                     "Успех", 
-                    f"Создан MP3 файл:\n{mp3_path}\n\n"
+                    f"Создан MP3 файл:\n{output_mp3_path}\n\n"
                     f"Объединено файлов: {len(audio_parts)}\n"
                     f"Размер: {mp3_size:.2f} КБ\n"
                     f"Битрейт: {bitrate}\n"
@@ -1519,9 +1828,9 @@ class SileroTTSApp:
             self.stop_progress()
             
         except Exception as e:
-            logging.error(f"Ошибка при объединении WAV в MP3: {e}", exc_info=True)
+            logging.error(f"Ошибка при объединении MP3: {e}", exc_info=True)
             self.update_status("Статус: Ошибка объединения ❌")
-            self.show_error("Ошибка", f"Не удалось объединить WAV файлы:\n{e}")
+            self.show_error("Ошибка", f"Не удалось объединить MP3 файлы:\n{e}")
             self.stop_progress()
     
     def load_model_threaded(self):
@@ -1601,7 +1910,7 @@ class SileroTTSApp:
             raise Exception("Модель не загружена")
         
         if speech_rate is None:
-            speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
+            speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
         
         try:
             # Очистка текста от неподдерживаемых XML-символов
@@ -1615,6 +1924,8 @@ class SileroTTSApp:
                 text = text.replace('—', '-').replace('–', '-')
                 # Заменяем многоточие на три точки
                 text = text.replace('…', '...')
+                # Удаляем символы ударений ^ (модель не поддерживает)
+                text = text.replace('^', '')
                 # Экранируем амперсанд
                 text = text.replace('&', '&amp;')
                 # Буква ё поддерживается - оставляем как есть
@@ -1666,35 +1977,71 @@ class SileroTTSApp:
     def update_status(self, message):
         """Безопасное обновление статуса в UI"""
         try:
-            self.root.after(0, lambda: self.status_var.set(message))
-            logging.debug(f"Статус обновлен: {message}")
+            self._pending_status_message = message
+
+            now = time.monotonic()
+            if (now - self._last_status_update_ts) < self.status_update_interval:
+                return
+
+            def apply_status():
+                if self._pending_status_message is None:
+                    return
+                latest = self._pending_status_message
+                self._pending_status_message = None
+                self.status_var.set(latest)
+                self._last_status_update_ts = time.monotonic()
+
+            self._ui_call(apply_status, wait=False)
         except Exception as e:
             logging.error(f"Ошибка при обновлении статуса: {e}")
     
     def start_progress(self, total_chunks=None):
         """Запуск прогресс-бара"""
         try:
-            if total_chunks is not None and total_chunks > 0:
-                self.progress['maximum'] = total_chunks
-                self.progress['value'] = 0
-            else:
-                self.progress['maximum'] = 100
-                self.progress['value'] = 0
+            self._last_progress_update_ts = 0.0
+
+            def apply_start():
+                if total_chunks is not None and total_chunks > 0:
+                    self.progress['maximum'] = total_chunks
+                    self.progress['value'] = 0
+                else:
+                    self.progress['maximum'] = 100
+                    self.progress['value'] = 0
+
+            self._ui_call(apply_start, wait=False)
         except Exception as e:
             logging.error(f"Ошибка при запуске прогресс-бара: {e}")
     
     def update_progress(self, value=None):
         """Обновление прогресс-бара (для режима чанков)"""
         try:
-            if value is not None:
-                self.progress['value'] = value
+            if value is None:
+                return
+
+            self._pending_progress_value = value
+            now = time.monotonic()
+            if (now - self._last_progress_update_ts) < self.progress_update_interval:
+                return
+
+            def apply_progress():
+                if self._pending_progress_value is None:
+                    return
+                latest = self._pending_progress_value
+                self._pending_progress_value = None
+                self.progress['value'] = latest
+                self._last_progress_update_ts = time.monotonic()
+
+            self._ui_call(apply_progress, wait=False)
         except Exception as e:
             logging.error(f"Ошибка при обновлении прогресс-бара: {e}")
     
     def stop_progress(self):
         """Остановка прогресс-бара"""
         try:
-            self.progress['value'] = self.progress['maximum']
+            def apply_stop():
+                self.progress['value'] = self.progress['maximum']
+
+            self._ui_call(apply_stop, wait=False)
         except Exception as e:
             logging.error(f"Ошибка при остановке прогресс-бара: {e}")
     
@@ -1731,13 +2078,13 @@ class SileroTTSApp:
     
     def play_audio(self):
         """Генерация и воспроизведение аудио"""
-        text = self.text_area.get("1.0", tk.END).strip()
+        text = self._get_text_widget_content(self.text_area).strip()
         if not text:
             logging.warning("Попытка воспроизведения пустого текста")
             self.show_warning("Внимание", "Введите текст для озвучки")
             return
         
-        speaker = self.speaker_combo.get()
+        speaker = self._get_combobox_value(self.speaker_combo)
         logging.info(f"=== Начало воспроизведения: текст='{text[:50]}...', голос='{speaker}' ===")
         
         try:
@@ -1753,7 +2100,7 @@ class SileroTTSApp:
             use_chunking = chunk_mode or self._should_use_chunking(text)
             
             # Получаем текущую скорость озвучки
-            speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
+            speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
 
             if use_chunking:
                 logging.info("Включён режим чанков для воспроизведения")
@@ -1866,13 +2213,13 @@ class SileroTTSApp:
     
     def save_audio(self):
         """Генерация и сохранение аудио в файл WAV"""
-        text = self.text_area.get("1.0", tk.END).strip()
+        text = self._get_text_widget_content(self.text_area).strip()
         if not text:
             logging.warning("Попытка сохранения пустого текста")
             self.show_warning("Внимание", "Введите текст для озвучки")
             return
         
-        speaker = self.speaker_combo.get()
+        speaker = self._get_combobox_value(self.speaker_combo)
         logging.info(f"=== Начало сохранения аудио: текст='{text[:50]}...', голос='{speaker}' ===")
         
         try:
@@ -1885,7 +2232,7 @@ class SileroTTSApp:
             self.start_progress()
             
             # Получение целевой директории
-            target_dir = self.target_dir_var.get() if hasattr(self, 'target_dir_var') else AUDIO_DIR
+            target_dir = self._get_variable_value(self.target_dir_var) if hasattr(self, 'target_dir_var') else AUDIO_DIR
             
             # Создание директории для аудио, если не существует
             if not os.path.exists(target_dir):
@@ -1893,7 +2240,7 @@ class SileroTTSApp:
                 logging.info(f"Создана директория для аудио: {target_dir}")
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            custom_dir = self.chunk_dir_var.get().strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
+            custom_dir = self._get_variable_value(self.chunk_dir_var).strip() if hasattr(self, 'chunk_dir_var') else "my_audiobook"
             if not custom_dir:
                 custom_dir = "my_audiobook"
             base_name = f"{custom_dir}_{timestamp}"
@@ -1901,123 +2248,177 @@ class SileroTTSApp:
             chunk_mode, save_parts, max_chars, silence_ms = self._get_chunk_settings()
             use_chunking = chunk_mode or self._should_use_chunking(text)
 
+            # Всегда сохраняем в MP3 напрямую через pydub
+            mp3_path = os.path.join(target_dir, f"{base_name}.mp3")
+            bitrate = self._get_variable_value(self.mp3_bitrate_var) if hasattr(self, 'mp3_bitrate_var') else "256k"
+            speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
+            
             if not use_chunking:
-                filename = f"{base_name}.wav"
-                full_path = os.path.join(target_dir, filename)
-                logging.info(f"Сохранение в файл: {full_path}")
-
-                self.model.save_wav(
-                    text=text,
-                    speaker=speaker,
-                    sample_rate=SAMPLE_RATE,
-                    audio_path=full_path
+                # Небольшой текст - генерируем одним куском и конвертируем в MP3
+                logging.info("Генерация аудио (единым блоком)...")
+                audio_tensor = self.generate_audio(text, speaker, speech_rate)
+                audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
+                
+                # Конвертация в MP3 через pydub
+                self.update_status(f"Статус: Конвертация в MP3...")
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=SAMPLE_RATE,
+                    sample_width=2,
+                    channels=1
                 )
+                audio_segment.export(mp3_path, format="mp3", bitrate=bitrate)
+                logging.info(f"MP3 файл создан: {mp3_path}")
             else:
+                # Большой текст - генерируем частями и собираем MP3 через ffmpeg concat
                 logging.info("Включён режим чанков для сохранения")
                 chunks = self.split_text_into_chunks(text, max_chars)
                 
                 # Запускаем прогресс-бар с количеством чанков
-                self.start_progress(total_chunks=len(chunks))
+                self.start_progress(total_chunks=len(chunks) * 2)
                 
                 silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
-                silence = np.zeros((silence_samples,), dtype=np.int16) if silence_samples > 0 else None
+                silence_segment = None
+                if silence_samples > 0:
+                    silence_segment = AudioSegment(
+                        np.zeros((silence_samples,), dtype=np.int16).tobytes(),
+                        frame_rate=SAMPLE_RATE,
+                        sample_width=2,
+                        channels=1
+                    )
                 
-                audio_parts = []
+                # Подсчет общей длительности (вместо накопления combined_audio в памяти)
+                total_duration = 0.0
+                parts_dir = os.path.join(target_dir, f"{base_name}_parts")
+                os.makedirs(parts_dir, exist_ok=True)
+                
                 for idx, chunk_text in enumerate(chunks, start=1):
                     # Проверка флага остановки
                     self.check_stop_flag()
                     
                     self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
-                    speech_rate = self.speech_rate_var.get() if hasattr(self, 'speech_rate_var') else 'medium'
                     audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
-                    audio_part_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
-                    audio_parts.append(audio_part_int16)
+                    audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
                     
-                    # Сохраняем часть если нужно
-                    if save_parts:
-                        parts_dir = os.path.join(target_dir, f"{base_name}_parts")
-                        os.makedirs(parts_dir, exist_ok=True)
-                        logging.info(f"Сохранение частей в: {parts_dir}")
-                        part_filename = f"part_{idx:03d}.wav"
-                        part_path = os.path.join(parts_dir, part_filename)
-                        self._write_wav_int16_mono(part_path, audio_part_int16)
+                    # Преобразование в AudioSegment
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=SAMPLE_RATE,
+                        sample_width=2,
+                        channels=1
+                    )
                     
-                    if silence is not None and idx != len(chunks):
-                        audio_parts.append(silence)
+                    # Подсчет длительности
+                    total_duration += audio_segment.duration_seconds
+                    
+                    # Сохраняем каждую часть в MP3 (всегда для ffmpeg concat)
+                    part_path = os.path.join(parts_dir, f"part_{idx:06d}.mp3")
+                    audio_segment.export(part_path, format="mp3", bitrate=bitrate)
+                    logging.info(f"Часть сохранена: {part_path}")
+                    
+                    # Добавляем паузу если нужно (сохраняем как отдельную тишину)
+                    if silence_segment is not None and idx != len(chunks):
+                        silence_path = os.path.join(parts_dir, f"part_{idx:06d}_silence.mp3")
+                        silence_segment.export(silence_path, format="mp3", bitrate=bitrate)
+                        logging.info(f"Пауза сохранена: {silence_path}")
                     
                     # Обновляем прогресс-бар
                     self.update_progress(idx)
-
-                filename = f"{base_name}.wav"
-                full_path = os.path.join(target_dir, filename)
-                logging.info(f"Сохранение итогового WAV: {full_path}")
-                audio_full_int16 = np.concatenate(audio_parts) if audio_parts else np.zeros((0,), dtype=np.int16)
-                self._write_wav_int16_mono(full_path, audio_full_int16)
-
-            if os.path.exists(full_path):
-                file_size = os.path.getsize(full_path) / 1024
-                logging.info(f"Файл {full_path} успешно создан (размер: {file_size:.2f} КБ)")
                 
-                # Конвертация в MP3 если включена опция
-                convert_to_mp3 = bool(self.convert_to_mp3_var.get()) if hasattr(self, 'convert_to_mp3_var') else False
-                mp3_path = None
-                if convert_to_mp3:
-                    self.update_status(f"Статус: Конвертация в MP3...")
-                    bitrate = self.mp3_bitrate_var.get() if hasattr(self, 'mp3_bitrate_var') else "192k"
-                    try:
-                        mp3_path = self.convert_wav_to_mp3(full_path, bitrate)
-                        logging.info(f"MP3 файл создан: {mp3_path}")
-                        
-                        # Удаляем WAV файл после успешной конвертации в MP3
+                # Сборка итогового MP3 через ffmpeg concat (избегаем WAV >2GB)
+                self.update_status(f"Статус: Сборка MP3 через ffmpeg concat...")
+                logging.info(f"Сборка MP3 через ffmpeg concat из {parts_dir}")
+                
+                import subprocess
+                import tempfile
+                
+                # Сортировка по числовому номеру чанка (не лексикографическая!)
+                def sort_key(path):
+                    import re
+                    filename = os.path.basename(path)
+                    match = re.match(r'part_(\d+)(?:_silence)?', filename)
+                    if match:
+                        return int(match.group(1))
+                    return 0
+                
+                part_files = sorted([
+                    os.path.join(parts_dir, f)
+                    for f in os.listdir(parts_dir)
+                    if f.lower().endswith('.mp3')
+                ], key=sort_key)
+                
+                logging.info(f"=== DEBUG CONCAT: найдено {len(part_files)} файлов для объединения ===")
+                for pf in part_files:
+                    logging.info(f"  CONCAT FILE: {pf}")
+                logging.info(f"=== END DEBUG ===")
+                
+                if not part_files:
+                    raise Exception("Не найдены MP3 части для сборки итогового файла")
+                
+                concat_list_path = tempfile.NamedTemporaryFile(delete=False, suffix='.txt').name
+                try:
+                    with open(concat_list_path, 'w', encoding='utf-8') as f:
+                        for part in part_files:
+                            escaped = part.replace("'", "'\\''")
+                            f.write(f"file '{escaped}'\n")
+                    
+                    subprocess.run([
+                        'ffmpeg', '-y',
+                        '-f', 'concat',
+                        '-safe', '0',
+                        '-i', concat_list_path,
+                        '-c', 'copy',
+                        mp3_path
+                    ], check=True, capture_output=True)
+                    
+                    logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+                except subprocess.CalledProcessError as ffmpeg_err:
+                    logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
+                    raise
+                finally:
+                    if os.path.exists(concat_list_path):
                         try:
-                            os.remove(full_path)
-                            logging.info(f"WAV файл удалён: {full_path}")
-                        except Exception as remove_error:
-                            logging.warning(f"Не удалось удалить WAV файл: {remove_error}")
-                        
-                        # Удаляем директорию с частями если включена опция
-                        delete_wav_dir = bool(self.delete_wav_dir_var.get()) if hasattr(self, 'delete_wav_dir_var') else False
-                        if delete_wav_dir and use_chunking and save_parts:
-                            parts_dir = os.path.join(target_dir, f"{base_name}_parts")
-                            logging.info(f"=== ПРОВЕРКА УДАЛЕНИЯ ДИРЕКТОРИИ С ЧАСТЯМИ ===")
-                            logging.info(f"  delete_wav_dir: {delete_wav_dir}")
-                            logging.info(f"  use_chunking: {use_chunking}")
-                            logging.info(f"  save_parts: {save_parts}")
-                            logging.info(f"  parts_dir: {parts_dir}")
-                            logging.info(f"  parts_dir существует: {os.path.exists(parts_dir)}")
-                            try:
-                                import shutil
-                                if os.path.exists(parts_dir):
-                                    shutil.rmtree(parts_dir)
-                                    logging.info(f"Директория с частями удалена: {parts_dir}")
-                                    logging.info(f"parts_dir существует после удаления: {os.path.exists(parts_dir)}")
-                                else:
-                                    logging.warning(f"Директория с частями не найдена: {parts_dir}")
-                            except Exception as del_error:
-                                logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
-                    except Exception as mp3_error:
-                        logging.error(f"Ошибка конвертации в MP3: {mp3_error}")
-                        self.show_warning("Предупреждение", f"WAV сохранён, но конвертация в MP3 не удалась:\n{str(mp3_error)}")
+                            os.remove(concat_list_path)
+                        except OSError:
+                            pass
                 
-                if mp3_path:
-                    mp3_size = os.path.getsize(mp3_path) / 1024
-                    self.update_status(f"Статус: Сохранено в MP3 ✅")
-                    extra = ""
-                    if use_chunking and save_parts:
-                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(target_dir, f'{base_name}_parts')}"
-                    message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\nРазмер: {mp3_size:.2f} КБ, битрейт: {bitrate}{extra}"
-                    # WAV файл был удалён
+                # Удаляем директорию с частями если включена опция
+                delete_wav_dir = bool(self._get_variable_value(self.delete_wav_dir_var)) if hasattr(self, 'delete_wav_dir_var') else True
+                if delete_wav_dir:
+                    logging.info(f"=== УДАЛЕНИЕ ДИРЕКТОРИИ С ЧАСТЯМИ ===")
+                    try:
+                        import shutil
+                        if os.path.exists(parts_dir):
+                            shutil.rmtree(parts_dir)
+                            logging.info(f"Директория с частями удалена: {parts_dir}")
+                    except Exception as del_error:
+                        logging.error(f"Не удалось удалить директорию с частями: {del_error}", exc_info=True)
+                
+                self.update_progress(len(chunks) * 2)
+            
+            # Показ сообщения об успехе
+            if os.path.exists(mp3_path):
+                mp3_size = os.path.getsize(mp3_path) / 1024
+                # Расчёт длительности аудио
+                if use_chunking:
+                    duration_seconds = total_duration
                 else:
-                    self.update_status(f"Статус: Сохранено в {os.path.basename(full_path)} ✅")
-                    extra = ""
-                    if use_chunking and save_parts:
-                        extra = f"\n\nЧасти сохранены в папку:\n{os.path.join(target_dir, f'{base_name}_parts')}"
-                    message = f"Аудио сохранено в файл:\n{full_path}\n\nРазмер: {file_size:.2f} КБ{extra}"
+                    # Для единого блока считаем длительность напрямую
+                    duration_seconds = audio_segment.duration_seconds
+                duration_hours = int(duration_seconds // 3600)
+                duration_minutes = int((duration_seconds % 3600) // 60)
+                duration_secs_remaining = int(duration_seconds % 60)
+                duration_formatted = f"{duration_hours}:{duration_minutes:02d}:{duration_secs_remaining:02d}"
                 
+                self.update_status(f"Статус: Сохранено в MP3 ✅")
+                message = f"Аудио сохранено в MP3 файл:\n{mp3_path}\n\n"
+                message += f"Размер: {mp3_size:.2f} КБ\n"
+                message += f"Битрейт: {bitrate}\n"
+                message += f"Длительность: {duration_formatted} ({duration_seconds:.1f} сек)"
                 self.show_info("Успех", message)
             else:
-                logging.error(f"Файл {full_path} не был создан")
-                raise Exception("Файл не был создан")
+                logging.error(f"MP3 файл {mp3_path} не был создан")
+                raise Exception("MP3 файл не был создан")
             
             self.stop_progress()
             
@@ -2063,7 +2464,20 @@ class SileroTTSApp:
         # Создаем топ-уровневое окно поиска
         find_dialog = tk.Toplevel(self.root)
         find_dialog.title("Поиск")
-        find_dialog.geometry("300x100")
+        
+        # Позиционирование по центру родительского окна
+        parent_x = self.root.winfo_x()
+        parent_y = self.root.winfo_y()
+        parent_width = self.root.winfo_width()
+        parent_height = self.root.winfo_height()
+        
+        dialog_width = 360
+        dialog_height = 120
+        
+        center_x = parent_x + (parent_width - dialog_width) // 2
+        center_y = parent_y + (parent_height - dialog_height) // 2
+        
+        find_dialog.geometry(f"{dialog_width}x{dialog_height}+{center_x}+{center_y}")
         find_dialog.transient(self.root)
         find_dialog.grab_set()
         
@@ -2100,8 +2514,9 @@ class SileroTTSApp:
                 text_widget.mark_set('insert', end_pos)
                 text_widget.see(pos)
                 search_state['last_pos'] = end_pos
+                self.update_status(f"Статус: Найдено '{search_text}' ✅")
             else:
-                messagebox.showinfo("Поиск", "Текст не найден", parent=find_dialog)
+                self.update_status(f"Статус: '{search_text}' не найден ❌")
                 search_state['last_pos'] = '1.0'
         
         def find_next_occurrence():
@@ -2126,6 +2541,7 @@ class SileroTTSApp:
                 text_widget.mark_set('insert', end_pos)
                 text_widget.see(pos)
                 search_state['last_pos'] = end_pos
+                self.update_status(f"Статус: Найдено следующее '{search_text}' ✅")
             else:
                 # Если не найдено, начинаем с начала
                 pos = text_widget.search(search_text, '1.0', stopindex=search_state['last_pos'])
@@ -2137,8 +2553,9 @@ class SileroTTSApp:
                     text_widget.mark_set('insert', end_pos)
                     text_widget.see(pos)
                     search_state['last_pos'] = end_pos
+                    self.update_status(f"Статус: Найдено с начала '{search_text}' ✅")
                 else:
-                    messagebox.showinfo("Поиск", "Больше не найдено", parent=find_dialog)
+                    self.update_status(f"Статус: Больше не найдено ❌")
                     search_state['last_pos'] = '1.0'
         
         # Кнопки
@@ -2274,10 +2691,154 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при вырезании в буфер обмена: {e}")
     
+    def save_log_to_file(self):
+        """Сохранение содержимого лога в файл в целевой директории"""
+        try:
+            from tkinter import filedialog
+            import datetime
+            
+            # Получение целевой директории
+            target_dir = AUDIO_DIR
+            if hasattr(self, 'target_dir_var'):
+                target_dir = self.target_dir_var.get()
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                target_dir = self.saved_config.get('target_dir', AUDIO_DIR)
+            
+            # Получение содержимого лога
+            log_content = self.log_area.get("1.0", tk.END).strip()
+            
+            if not log_content:
+                self.update_status("Статус: Лог пуст для сохранения ❌")
+                return
+            
+            # Формирование имени файла с датой
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"silero_log_{timestamp}.txt"
+            
+            # Диалог сохранения файла с начальной директорией
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+                initialfile=default_filename,
+                initialdir=target_dir,
+                title="Сохранить лог в файл"
+            )
+            
+            if file_path:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(log_content)
+                self.update_status(f"Статус: Лог сохранён в {os.path.basename(file_path)} ✅")
+                logging.info(f"Лог сохранён в файл: {file_path}")
+            
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении лога: {e}")
+            self.update_status(f"Статус: Ошибка сохранения лога ❌ {e}")
+    
     def clear_log(self):
-        """Очистка лога (информационное сообщение)"""
-        logging.info("Очистка лога вызвана - логи теперь только в консоли")
-        self.show_info("Лог", "Логирование теперь выполняется только в консоль.\nФайлы логов не создаются.")
+        """Очистка текстового поля лога"""
+        try:
+            self.log_area.delete("1.0", tk.END)
+            self.update_status("Статус: Лог очищен ✅")
+            logging.info("Лог очищен пользователем")
+        except Exception as e:
+            logging.error(f"Ошибка при очистке лога: {e}")
+            self.update_status(f"Статус: Ошибка очистки лога ❌ {e}")
+    
+    def save_chunks_to_file(self):
+        """Сохранение содержимого чанков в файл в целевой директории"""
+        try:
+            from tkinter import filedialog
+            import datetime
+            
+            # Получение целевой директории
+            target_dir = AUDIO_DIR
+            if hasattr(self, 'target_dir_var'):
+                target_dir = self.target_dir_var.get()
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                target_dir = self.saved_config.get('target_dir', AUDIO_DIR)
+            
+            # Получение содержимого чанков
+            chunks_content = self.chunks_area.get("1.0", tk.END).strip()
+            
+            if not chunks_content:
+                self.update_status("Статус: Чанки пусты для сохранения ❌")
+                return
+            
+            # Формирование имени файла с датой
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"silero_chunks_{timestamp}.txt"
+            
+            # Диалог сохранения файла с начальной директорией
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+                initialfile=default_filename,
+                initialdir=target_dir,
+                title="Сохранить чанки в файл"
+            )
+            
+            if file_path:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(chunks_content)
+                self.update_status(f"Статус: Чанки сохранены в {os.path.basename(file_path)} ✅")
+                logging.info(f"Чанки сохранены в файл: {file_path}")
+            
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении чанков: {e}")
+            self.update_status(f"Статус: Ошибка сохранения чанков ❌ {e}")
+    
+    def clear_chunks(self):
+        """Очистка текстового поля чанков"""
+        try:
+            self.chunks_area.delete("1.0", tk.END)
+            self.update_status("Статус: Чанки очищены ✅")
+            logging.info("Чанки очищены пользователем")
+        except Exception as e:
+            logging.error(f"Ошибка при очистке чанков: {e}")
+            self.update_status(f"Статус: Ошибка очистки чанков ❌ {e}")
+    
+    def save_text_to_file(self):
+        """Сохранение текста из вкладки Текст в файл в целевой директории"""
+        try:
+            from tkinter import filedialog
+            import datetime
+            
+            # Получение целевой директории
+            target_dir = AUDIO_DIR
+            if hasattr(self, 'target_dir_var'):
+                target_dir = self.target_dir_var.get()
+            elif hasattr(self, 'saved_config') and 'target_dir' in self.saved_config:
+                target_dir = self.saved_config.get('target_dir', AUDIO_DIR)
+            
+            # Получение содержимого текста
+            text_content = self.text_area.get("1.0", tk.END).strip()
+            
+            if not text_content:
+                self.update_status("Статус: Текст пуст для сохранения ❌")
+                return
+            
+            # Формирование имени файла с датой
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"silero_text_{timestamp}.txt"
+            
+            # Диалог сохранения файла с начальной директорией
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Текстовые файлы", "*.txt"), ("Все файлы", "*.*")],
+                initialfile=default_filename,
+                initialdir=target_dir,
+                title="Сохранить текст в файл"
+            )
+            
+            if file_path:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(text_content)
+                self.update_status(f"Статус: Текст сохранён в {os.path.basename(file_path)} ✅")
+                logging.info(f"Текст сохранён в файл: {file_path}")
+            
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении текста: {e}")
+            self.update_status(f"Статус: Ошибка сохранения текста ❌ {e}")
     
     def open_audio_folder(self):
         """Открытие папки с аудиофайлами в проводнике Windows"""
@@ -2333,6 +2894,177 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при очистке ресурсов: {e}")
         
+    def _process_chunks_with_progress(self, chunks, speaker, speech_rate, silence_ms, parts_dir, use_wav_streaming, bitrate, base_name, target_dir):
+        """
+        Вспомогательный метод для обработки чанков с поддержкой двух вариантов:
+        - Вариант 1: Потоковая запись WAV → ffmpeg конвертация
+        - Вариант 2: Прямая MP3 запись → ffmpeg concat
+        
+        Возвращает: (mp3_path, total_duration)
+        """
+        import subprocess
+        import tempfile
+        
+        total_duration = 0.0
+        silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
+        
+        if use_wav_streaming:
+            # === ВАРИАНТ 1: Потоковая запись WAV → ffmpeg конвертация ===
+            logging.info(f"Вариант 1: Потоковая запись WAV → ffmpeg конвертация ({len(chunks)} чанков)")
+            
+            temp_wav_path = os.path.join(parts_dir, "temp_full.wav")
+            
+            # Потоковая запись в WAV
+            with wave.open(temp_wav_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(SAMPLE_RATE)
+                
+                for idx, chunk_text in enumerate(chunks, start=1):
+                    self.check_stop_flag()
+                    self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                    
+                    audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
+                    audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
+                    
+                    # Прямая запись в WAV
+                    wav_file.writeframes(audio_int16.tobytes())
+                    
+                    # Подсчет длительности
+                    audio_duration = len(audio_int16) / SAMPLE_RATE
+                    total_duration += audio_duration
+                    
+                    # Добавление паузы
+                    if silence_samples > 0 and idx != len(chunks):
+                        silence_array = np.zeros(silence_samples, dtype=np.int16)
+                        wav_file.writeframes(silence_array.tobytes())
+                        total_duration += silence_ms / 1000.0
+                    
+                    self.update_progress(idx)
+            
+            # Конвертация WAV → MP3
+            mp3_path = os.path.join(target_dir, f"{base_name}.mp3")
+            self.update_status(f"Статус: Конвертация WAV → MP3...")
+            logging.info(f"Конвертация в MP3: {mp3_path} (битрейт: {bitrate})")
+            
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-i', temp_wav_path,
+                '-b:a', bitrate,
+                '-ar', str(SAMPLE_RATE),
+                mp3_path
+            ], check=True, capture_output=True)
+            
+            logging.info(f"MP3 создан через ffmpeg конвертацию: {mp3_path}")
+            
+            # Удаление временного WAV
+            if os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+            
+            # Обновление прогресса
+            self.update_progress(len(chunks) * 2)
+            
+        else:
+            # === ВАРИАНТ 2: Прямая MP3 запись → ffmpeg concat ===
+            logging.info(f"Вариант 2: Прямая MP3 запись → ffmpeg concat ({len(chunks)} чанков)")
+            
+            silence_segment = None
+            if silence_samples > 0:
+                silence_segment = AudioSegment(
+                    np.zeros((silence_samples,), dtype=np.int16).tobytes(),
+                    frame_rate=SAMPLE_RATE,
+                    sample_width=2,
+                    channels=1
+                )
+            
+            for idx, chunk_text in enumerate(chunks, start=1):
+                self.check_stop_flag()
+                self.update_status(f"Статус: Генерация части {idx}/{len(chunks)}...")
+                
+                audio_tensor = self.generate_audio(chunk_text, speaker, speech_rate)
+                audio_int16 = self._tensor_audio_to_int16_mono(audio_tensor)
+                
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=SAMPLE_RATE,
+                    sample_width=2,
+                    channels=1
+                )
+                
+                total_duration += audio_segment.duration_seconds
+                
+                # Сохранение части
+                part_path = os.path.join(parts_dir, f"part_{idx:06d}.mp3")
+                audio_segment.export(part_path, format="mp3", bitrate=bitrate)
+                logging.info(f"Часть сохранена: {part_path}")
+                
+                # Добавление паузы
+                if silence_segment is not None and idx != len(chunks):
+                    silence_path = os.path.join(parts_dir, f"part_{idx:06d}_silence.mp3")
+                    silence_segment.export(silence_path, format="mp3", bitrate=bitrate)
+                    logging.info(f"Пауза сохранена: {silence_path}")
+                
+                self.update_progress(idx)
+            
+            # Сборка MP3 через ffmpeg concat
+            mp3_path = os.path.join(target_dir, f"{base_name}.mp3")
+            self.update_status(f"Статус: Сборка MP3 через ffmpeg concat...")
+            logging.info(f"Экспорт в MP3: {mp3_path} (битрейт: {bitrate})")
+            
+            # Сортировка по числовому номеру чанка (не лексикографическая!)
+            def sort_key(path):
+                import re
+                filename = os.path.basename(path)
+                match = re.match(r'part_(\d+)(?:_silence)?', filename)
+                if match:
+                    return int(match.group(1))
+                return 0
+            
+            part_files = sorted([
+                os.path.join(parts_dir, f)
+                for f in os.listdir(parts_dir)
+                if f.lower().endswith('.mp3')
+            ], key=sort_key)
+            
+            logging.info(f"=== DEBUG CONCAT: найдено {len(part_files)} файлов для объединения ===")
+            for pf in part_files:
+                logging.info(f"  CONCAT FILE: {pf}")
+            logging.info(f"=== END DEBUG ===")
+            
+            if not part_files:
+                raise Exception("Не найдены MP3 части для сборки итогового файла")
+            
+            concat_list_path = tempfile.NamedTemporaryFile(delete=False, suffix='.txt').name
+            try:
+                with open(concat_list_path, 'w', encoding='utf-8') as f:
+                    for part in part_files:
+                        escaped = part.replace("'", "'\\''")
+                        f.write(f"file '{escaped}'\n")
+                
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', concat_list_path,
+                    '-c', 'copy',
+                    mp3_path
+                ], check=True, capture_output=True)
+                
+                logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+            except subprocess.CalledProcessError as ffmpeg_err:
+                logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
+                raise
+            finally:
+                if os.path.exists(concat_list_path):
+                    try:
+                        os.remove(concat_list_path)
+                    except OSError:
+                        pass
+            
+            self.update_progress(len(chunks) * 2)
+        
+        return mp3_path, total_duration
+
     def on_closing(self):
         """Обработка закрытия окна"""
         logging.info("Приложение закрывается")
@@ -2428,6 +3160,7 @@ def run_cli(args):
             return 1
         
         logging.info(f"Текст для озвучки: {len(text)} символов")
+        text = text.replace('^', '')
         
         # Предобработка текста если включена
         if args.preprocess:
@@ -2459,7 +3192,6 @@ def run_cli(args):
         speech_rate = args.speech_rate if hasattr(args, 'speech_rate') else 'medium'
         max_chars = args.max_chars if hasattr(args, 'max_chars') else DEFAULT_MAX_CHARS_PER_CHUNK
         silence_ms = args.silence_ms if hasattr(args, 'silence_ms') else DEFAULT_SILENCE_MS
-        convert_to_mp3 = args.mp3 if hasattr(args, 'mp3') else False
         mp3_bitrate = args.bitrate if hasattr(args, 'bitrate') else '192k'
         
         # Определение целевой директории
@@ -2468,14 +3200,18 @@ def run_cli(args):
             os.makedirs(output_dir, exist_ok=True)
             logging.info(f"Целевая директория: {output_dir}")
         
-        # Определение выходного файла
+        # Определение выходного файла (всегда MP3)
         output_path = args.output
         if not output_path:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"tts_output_{timestamp}.wav"
+            output_filename = f"tts_output_{timestamp}.mp3"
             output_path = os.path.join(output_dir, output_filename) if output_dir else output_filename
         elif output_dir and not os.path.isabs(output_path):
             output_path = os.path.join(output_dir, output_path)
+        
+        # Если расширение .wav, меняем на .mp3
+        if output_path.lower().endswith('.wav'):
+            output_path = os.path.splitext(output_path)[0] + '.mp3'
         
         # Разбиение на чанки если текст большой или включен режим чанков
         use_chunking = args.chunks if hasattr(args, 'chunks') else len(text) > AUTO_CHUNK_THRESHOLD
@@ -2485,20 +3221,31 @@ def run_cli(args):
             chunks = text_preprocessor._split_text_into_chunks(text, max_chars)
             logging.info(f"Текст разбит на {len(chunks)} чанков")
             
-            # Создание директории для частей если включена опция
-            save_parts = args.save_parts if hasattr(args, 'save_parts') else False
-            parts_dir = None
-            if save_parts:
-                parts_dir = os.path.splitext(output_path)[0] + "_parts"
-                os.makedirs(parts_dir, exist_ok=True)
-                logging.info(f"Директория для частей создана: {parts_dir}")
+            # Создание директории для MP3 частей
+            parts_dir = os.path.splitext(output_path)[0] + "_parts"
+            os.makedirs(parts_dir, exist_ok=True)
+            logging.info(f"Директория для частей создана: {parts_dir}")
             
             silence_samples = int(SAMPLE_RATE * (silence_ms / 1000.0))
-            silence = np.zeros((silence_samples,), dtype=np.int16) if silence_samples > 0 else None
             
-            audio_parts = []
+            # Прямая запись каждой части в MP3 файл через pydub
+            from pydub import AudioSegment
+            import numpy as np_module
+            
+            silence_segment = None
+            if silence_samples > 0:
+                silence_segment = AudioSegment(
+                    np_module.zeros((silence_samples,), dtype=np_module.int16).tobytes(),
+                    frame_rate=SAMPLE_RATE,
+                    sample_width=2,
+                    channels=1
+                )
+            
             for idx, chunk_text in enumerate(chunks, start=1):
                 logging.info(f"Обработка чанка {idx}/{len(chunks)}")
+                
+                # Очистка от неподдерживаемых символов (включая ^ для ударений)
+                chunk_text = chunk_text.replace('^', '')
                 
                 # Формирование SSML
                 chunk_escaped = html.escape(chunk_text, quote=False)
@@ -2517,27 +3264,82 @@ def run_cli(args):
                     put_accent=True,
                     put_yo=True
                 )
-                audio_int16 = (audio_tensor.numpy() * 32767).astype(np.int16)
+                audio_int16 = (audio_tensor.numpy() * 32767).astype(np_module.int16)
                 if len(audio_int16.shape) == 2:
                     audio_int16 = audio_int16[:, 0]
                 
-                # Сохранение части в файл если включена опция
-                if save_parts and parts_dir:
-                    part_path = os.path.join(parts_dir, f"part_{idx:03d}.wav")
-                    with wave.open(part_path, 'wb') as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(SAMPLE_RATE)
-                        wf.writeframes(audio_int16.tobytes())
-                    logging.debug(f"Часть {idx} сохранена: {part_path}")
+                # Преобразование в AudioSegment и сохранение в MP3
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=SAMPLE_RATE,
+                    sample_width=2,
+                    channels=1
+                )
+                part_path = os.path.join(parts_dir, f"part_{idx:06d}.mp3")
+                audio_segment.export(part_path, format="mp3", bitrate=mp3_bitrate)
+                logging.debug(f"Часть {idx} сохранена: {part_path}")
                 
-                audio_parts.append(audio_int16)
-                if silence is not None and idx != len(chunks):
-                    audio_parts.append(silence)
+                # Сохранение паузы если нужно
+                if silence_segment is not None and idx != len(chunks):
+                    silence_path = os.path.join(parts_dir, f"part_{idx:06d}_silence.mp3")
+                    silence_segment.export(silence_path, format="mp3", bitrate=mp3_bitrate)
+                    logging.debug(f"Пауза сохранена: {silence_path}")
             
-            audio_full = np.concatenate(audio_parts)
+            # Сборка итогового MP3 через ffmpeg concat
+            logging.info(f"Сборка MP3 через ffmpeg concat из {parts_dir}")
+            import subprocess
+            import tempfile
+            
+            # Сортировка MP3 файлов по числовому номеру
+            def sort_key(path):
+                import re
+                filename = os.path.basename(path)
+                match = re.match(r'part_(\d+)(?:_silence)?', filename)
+                if match:
+                    return int(match.group(1))
+                return 0
+            
+            part_files = sorted([
+                os.path.join(parts_dir, f)
+                for f in os.listdir(parts_dir)
+                if f.lower().endswith('.mp3')
+            ], key=sort_key)
+            
+            if not part_files:
+                raise Exception("Не найдены MP3 части для сборки итогового файла")
+            
+            concat_list_path = tempfile.NamedTemporaryFile(delete=False, suffix='.txt').name
+            try:
+                with open(concat_list_path, 'w', encoding='utf-8') as f:
+                    for part in part_files:
+                        escaped = part.replace("'", "'\\''")
+                        f.write(f"file '{escaped}'\n")
+                
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', concat_list_path,
+                    '-c', 'copy',
+                    output_path
+                ], check=True, capture_output=True)
+                
+                logging.info(f"MP3 создан через ffmpeg concat: {output_path}")
+            except subprocess.CalledProcessError as ffmpeg_err:
+                logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
+                raise
+            finally:
+                if os.path.exists(concat_list_path):
+                    try:
+                        os.remove(concat_list_path)
+                    except OSError:
+                        pass
+            
+            audio_full = None  # Не используется при потоковой записи
         else:
             logging.info("Генерация без разбиения на чанки")
+            # Очистка от неподдерживаемых символов (включая ^ для ударений)
+            text = text.replace('^', '')
             text_escaped = html.escape(text, quote=False)
             # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
             text_with_pauses = re.sub(r'\.\s*', '<s>.</s> ', text_escaped)
@@ -2558,41 +3360,34 @@ def run_cli(args):
             if len(audio_full.shape) == 2:
                 audio_full = audio_full[:, 0]
         
-        # Сохранение WAV
-        logging.info(f"Сохранение WAV: {output_path}")
-        with wave.open(output_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_full.tobytes())
+        # Сохранение напрямую в MP3 (независимо от режима)
+        from pydub import AudioSegment
+        if not use_chunking:
+            # Небольшой текст - генерируем одним куском и сохраняем в MP3
+            logging.info(f"Сохранение MP3: {output_path}")
+            audio_segment = AudioSegment(
+                audio_full.tobytes(),
+                frame_rate=SAMPLE_RATE,
+                sample_width=2,
+                channels=1
+            )
+            audio_segment.export(output_path, format="mp3", bitrate=mp3_bitrate)
+            mp3_size = os.path.getsize(output_path) / 1024
+            logging.info(f"MP3 сохранён: {output_path} ({mp3_size:.2f} КБ)")
+        else:
+            # При chunking режиме MP3 уже создан через ffmpeg concat
+            mp3_size = os.path.getsize(output_path) / 1024
+            logging.info(f"MP3 создан через ffmpeg concat: {output_path} ({mp3_size:.2f} КБ)")
         
-        wav_size = os.path.getsize(output_path) / 1024
-        logging.info(f"WAV сохранён: {output_path} ({wav_size:.2f} КБ)")
-        
-        # Конвертация в MP3 если включена
-        if convert_to_mp3:
-            logging.info(f"Конвертация в MP3 (битрейт: {mp3_bitrate})...")
-            audio = AudioSegment.from_wav(output_path)
-            mp3_path = os.path.splitext(output_path)[0] + ".mp3"
-            audio.export(mp3_path, format="mp3", bitrate=mp3_bitrate)
-            mp3_size = os.path.getsize(mp3_path) / 1024
-            logging.info(f"MP3 сохранён: {mp3_path} ({mp3_size:.2f} КБ)")
-            
-            # Удаление WAV если запрошено
-            if args.no_wav if hasattr(args, 'no_wav') else False:
-                os.remove(output_path)
-                logging.info(f"WAV удалён: {output_path}")
-                output_path = mp3_path
-            
-            # Удаление директории с частями если запрошено
-            delete_parts = args.delete_parts if hasattr(args, 'delete_parts') else False
-            if delete_parts and parts_dir and os.path.exists(parts_dir):
-                try:
-                    import shutil
-                    shutil.rmtree(parts_dir)
-                    logging.info(f"Директория с частями удалена: {parts_dir}")
-                except Exception as del_error:
-                    logging.error(f"Не удалось удалить директорию с частями: {del_error}")
+        # Удаление директории с частями если запрошено
+        delete_parts = args.delete_parts if hasattr(args, 'delete_parts') else False
+        if delete_parts and parts_dir and os.path.exists(parts_dir):
+            try:
+                import shutil
+                shutil.rmtree(parts_dir)
+                logging.info(f"Директория с частями удалена: {parts_dir}")
+            except Exception as del_error:
+                logging.error(f"Не удалось удалить директорию с частями: {del_error}")
         
         print(f"✅ Аудио сохранено: {output_path}")
         logging.info("=== CLI режим завершен успешно ===")
