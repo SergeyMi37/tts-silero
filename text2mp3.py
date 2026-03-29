@@ -196,6 +196,51 @@ class SileroTTSApp:
         """Чтение значения Combobox строго из UI-потока."""
         return self._ui_call(combobox.get, wait=True)
     
+    def create_tooltip(self, widget, text):
+        """Универсальная функция создания всплывающей подсказки (tooltip).
+        
+        Аргументы:
+            widget: Виджет, для которого создаётся подсказка
+            text: Текст подсказки
+        """
+        tooltip_window = None
+
+        def on_enter(event):
+            nonlocal tooltip_window
+            if tooltip_window is not None:
+                return
+
+            # Получение координат виджета
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height()
+            
+            # Создание окна подсказки
+            tooltip_window = tk.Toplevel(widget)
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.wm_geometry(f"+{x}+{y}")
+            
+            # Оформление подсказки
+            tooltip_label = tk.Label(
+                tooltip_window,
+                text=text,
+                background="#ffffe0",
+                foreground="#000000",
+                relief=tk.SOLID,
+                borderwidth=1,
+                font=("Arial", 9)
+            )
+            tooltip_label.pack()
+            
+        def on_leave(event):
+            nonlocal tooltip_window
+            if tooltip_window is not None:
+                tooltip_window.destroy()
+                tooltip_window = None
+
+        # Привязка событий мыши
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+    
     def load_config(self):
         """Загрузка настроек из JSON файла"""
         try:
@@ -405,10 +450,14 @@ class SileroTTSApp:
         # Кнопка воспроизведения
         self.play_btn = ttk.Button(controls_frame, text="▶ Сгенерировать и воспроизвести", command=self.play_audio_threaded)
         self.play_btn.pack(side=tk.LEFT, padx=5)
-        
+        self.create_tooltip(self.play_btn, "Генерить аудио и сразу возпроизводить")
+
         # Кнопка сохранения
-        self.save_btn = ttk.Button(controls_frame, text="💾 Сохранить (WAV/MP3)", command=self.save_audio_threaded)
+        self.save_btn = ttk.Button(controls_frame, text="💾 Озвучить все и сохранить MP3", command=self.save_audio_threaded)
         self.save_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Добавляем всплывающую подсказку на кнопку "Сделать универсальную функцию всплывающей подказки и Добавить ее только на кнопку Сохранить WAV"
+        self.create_tooltip(self.save_btn, "Озвучить текст и сохранить аудио в формате MP3")
         
         # Кнопка остановки
         self.stop_btn = ttk.Button(controls_frame, text="⏹ Остановить", command=self.stop_audio)
