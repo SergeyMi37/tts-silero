@@ -137,6 +137,45 @@ ffmpeg -version
 
 Должно вывести информацию о версии ffmpeg. Если команда не найдена — перезапустите терминал или перезагрузите компьютер.
 
+## Компиляция в EXE
+
+### Установка PyInstaller
+
+```bash
+pip install pyinstaller
+```
+
+### Создание EXE файла
+
+Используйте готовый spec-файл, который уже содержит все необходимые настройки:
+
+```bash
+pyinstaller text2mp3.spec
+```
+
+Готовый файл появится в папке `dist/text2mp3.exe`.
+
+### Ручная сборка (альтернатива)
+
+```bash
+pyinstaller --onefile --windowed --name text2mp3 --icon=book-dyn.ico --add-data "book-dyn.ico;." --hidden-import=silero_stress.data --hidden-import=silero_stress --hidden-import=num2words --hidden-import=num2words.lang_RU text2mp3.py
+```
+
+| Параметр | Описание |
+|----------|----------|
+| `--onefile` | Упаковать всё в один exe файл |
+| `--windowed` | Запуск без консольного окна |
+| `--name` | Имя выходного файла |
+| `--icon` | Иконка exe файла |
+| `--add-data "файл;."` | Встроить файл данных в exe (Windows) |
+| `--hidden-import` | Добавить скрытый импорт (нужен для silero_stress.data) |
+
+### Примечания
+
+- При первом запуске может потребоваться скачать модели Silero TTS
+- Файл будет весить ~200-400 МБ из-за включения Python и зависимостей
+- ffmpeg должен быть установлен в системе отдельно
+
 ## Лицензия
 
 Apache 2.0 (модель Silero TTS)

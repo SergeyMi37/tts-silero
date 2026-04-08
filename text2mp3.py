@@ -23,6 +23,21 @@ import argparse
 # Константы для логирования
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
 
+# Скрытие консольного окна при вызове subprocess в Windows
+if sys.platform == 'win32':
+    SUBPROCESS_KWARGS = {'creationflags': subprocess.CREATE_NO_WINDOW}
+    # pydub использует subprocess.Popen для ffmpeg — патчим и его
+    _original_popen = subprocess.Popen
+
+    def _patched_popen(*args, **kwargs):
+        if 'creationflags' not in kwargs:
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        return _original_popen(*args, **kwargs)
+
+    subprocess.Popen = _patched_popen
+else:
+    SUBPROCESS_KWARGS = {}
+
 # Настройка логирования (только в консоль)
 logging.basicConfig(
     level=logging.INFO,
@@ -118,7 +133,17 @@ class SileroTTSApp:
         self.root.geometry("1200x500")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
+        # Установка иконки окна
+        if getattr(sys, 'frozen', False):
+            # Запуск из PyInstaller exe
+            base_path = sys._MEIPASS
+        else:
+            # Запуск из исходников
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_path, 'book-dyn.ico')
+        if os.path.exists(icon_path):
+            self.root.iconbitmap(icon_path)
+
         self.model = None
         self.is_model_loaded = False
         self.current_sound = None  # Для хранения текущего звукового объекта
@@ -450,14 +475,14 @@ class SileroTTSApp:
         # Кнопка воспроизведения
         self.play_btn = ttk.Button(controls_frame, text="▶ Сгенерировать и воспроизвести", command=self.play_audio_threaded)
         self.play_btn.pack(side=tk.LEFT, padx=5)
-        self.create_tooltip(self.play_btn, "Генерить аудио и сразу возпроизводить")
+        self.create_tooltip(self.play_btn, "Генерить аудио и сразу возпроизводить без записи в файл")
 
         # Кнопка сохранения
         self.save_btn = ttk.Button(controls_frame, text="💾 Озвучить все и сохранить MP3", command=self.save_audio_threaded)
         self.save_btn.pack(side=tk.LEFT, padx=5)
         
         # Добавляем всплывающую подсказку на кнопку "Сделать универсальную функцию всплывающей подказки и Добавить ее только на кнопку Сохранить WAV"
-        self.create_tooltip(self.save_btn, "Озвучить текст и сохранить аудио в формате MP3")
+        self.create_tooltip(self.save_btn, "Озвучить текст и сохранить в MP3")
         
         # Кнопка остановки
         self.stop_btn = ttk.Button(controls_frame, text="⏹ Остановить", command=self.stop_audio)
@@ -1283,9 +1308,9 @@ class SileroTTSApp:
                     '-b:a', bitrate,
                     '-ar', str(SAMPLE_RATE),
                     mp3_path
-                ], check=True, capture_output=True)
+                ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
                 
-                logging.info(f"MP3 создан через ffmpeg конвертацию: {mp3_path}")
+                logging.info(f"MP3 создан через ffmpeg конвертацию: --{SUBPROCESS_KWARGS} {mp3_path}")
                 
                 # Удаление временного WAV
                 if os.path.exists(temp_wav_path):
@@ -1390,9 +1415,9 @@ class SileroTTSApp:
                         '-i', concat_list_path,
                         '-c', 'copy',
                         mp3_path
-                    ], check=True, capture_output=True)
+                    ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
 
-                    logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+                    logging.info(f"MP3 создан через ffmpeg concat: --{SUBPROCESS_KWARGS} {mp3_path}")
                 except subprocess.CalledProcessError as ffmpeg_err:
                     logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
                     raise
@@ -2417,9 +2442,9 @@ class SileroTTSApp:
                         '-i', concat_list_path,
                         '-c', 'copy',
                         mp3_path
-                    ], check=True, capture_output=True)
+                    ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
                     
-                    logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+                    logging.info(f"MP3 создан через ffmpeg concat: --{SUBPROCESS_KWARGS}  {mp3_path}")
                 except subprocess.CalledProcessError as ffmpeg_err:
                     logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
                     raise
@@ -3001,9 +3026,9 @@ class SileroTTSApp:
                 '-b:a', bitrate,
                 '-ar', str(SAMPLE_RATE),
                 mp3_path
-            ], check=True, capture_output=True)
+            ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
             
-            logging.info(f"MP3 создан через ffmpeg конвертацию: {mp3_path}")
+            logging.info(f"MP3 создан через ffmpeg конвертацию:--{SUBPROCESS_KWARGS}  {mp3_path}")
             
             # Удаление временного WAV
             if os.path.exists(temp_wav_path):
@@ -3096,9 +3121,9 @@ class SileroTTSApp:
                     '-i', concat_list_path,
                     '-c', 'copy',
                     mp3_path
-                ], check=True, capture_output=True)
+                ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
                 
-                logging.info(f"MP3 создан через ffmpeg concat: {mp3_path}")
+                logging.info(f"MP3 создан через ffmpeg concat: --{SUBPROCESS_KWARGS} {mp3_path}")
             except subprocess.CalledProcessError as ffmpeg_err:
                 logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
                 raise
@@ -3370,9 +3395,9 @@ def run_cli(args):
                     '-i', concat_list_path,
                     '-c', 'copy',
                     output_path
-                ], check=True, capture_output=True)
+                ], check=True, capture_output=True, **SUBPROCESS_KWARGS)
                 
-                logging.info(f"MP3 создан через ffmpeg concat: {output_path}")
+                logging.info(f"MP3 создан через ffmpeg concat:--{SUBPROCESS_KWARGS} {output_path}")
             except subprocess.CalledProcessError as ffmpeg_err:
                 logging.error(f"ffmpeg error: {ffmpeg_err.stderr.decode(errors='replace')}")
                 raise
