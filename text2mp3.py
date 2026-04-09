@@ -71,11 +71,24 @@ SPEAKERS = ['baya', 'eugene', 'kseniya', 'xenia', 'random']
 
 # Настройки разбиения на кусочки больших текстов
 AUTO_CHUNK_THRESHOLD = 3000
-DEFAULT_MAX_CHARS_PER_CHUNK = 1200
+DEFAULT_MAX_CHARS_PER_CHUNK = 1010
 DEFAULT_SILENCE_MS = 200
 
 # Тестовый текст по умолчанию
 DEFAULT_DEMO_TEXT = "Это демонстрация работы Silero TTS версии 5. Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности! В недрах тундры выдры в г+етрах т+ырят в вёдра ядра к+едров."
+
+
+def preserve_linebreaks_as_pauses(text):
+    """Замена переносов строк на паузы. Вызывать ДО предобработки."""
+    if not text:
+        return text
+    
+    def replace_newlines(m):
+        count = m.group(0).count('\n')
+        return f'<break time="{count}s"/>'
+    
+    text = re.sub(r'\n+', replace_newlines, text)
+    return text
 
 
 def clean_xml_text(text):
@@ -86,8 +99,18 @@ def clean_xml_text(text):
     text = text.replace('…', '...')
     text = text.replace('^', '')
     text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)', '&amp;', text)
+    # Временно сохраняем <break .../> теги
+    breaks = []
+    def save_break(m):
+        breaks.append(m.group(0))
+        return f'\x00B{len(breaks)-1}\x00'
+    text = re.sub(r'<break\s[^>]*/>', save_break, text)
+    # Экранируем остальные < и >
     text = text.replace('<', '&lt;')
     text = text.replace('>', '&gt;')
+    # Возвращаем break теги
+    for i, orig in enumerate(breaks):
+        text = text.replace(f'\x00B{i}\x00', orig)
     text = ' '.join(text.split())
     return text
 
@@ -440,17 +463,17 @@ class SileroTTSApp:
         self.split_chunks_btn = ttk.Button(chunks_controls, text="✂ Разделить текст на кусочки", command=self.split_text_to_chunks_ui)
         self.split_chunks_btn.pack(side=tk.LEFT)
 
-        self.speak_chunks_btn = ttk.Button(chunks_controls, text="🔊 Озвучивать кусочки в файл", command=self.speak_chunks_threaded)
+        self.speak_chunks_btn = ttk.Button(chunks_controls, text="🔊 Озвучить кусочки в MP3", command=self.speak_chunks_threaded)
         self.speak_chunks_btn.pack(side=tk.LEFT, padx=(8, 0))
         
-        self.save_chunks_btn = ttk.Button(chunks_controls, text="💾 Сохранить в файл", command=self.save_chunks_to_file)
+        self.save_chunks_btn = ttk.Button(chunks_controls, text="💾 Сохранить текст", command=self.save_chunks_to_file)
         self.save_chunks_btn.pack(side=tk.LEFT, padx=(15, 5))
         
         self.clear_chunks_btn = ttk.Button(chunks_controls, text="🗑 Очистить текст", command=self.clear_chunks)
         self.clear_chunks_btn.pack(side=tk.LEFT)
         
-        self.merge_mp3_btn = ttk.Button(chunks_controls, text="🔗 Объединить в MP3", command=self.merge_wav_to_mp3_threaded)
-        self.merge_mp3_btn.pack(side=tk.LEFT, padx=(15, 5))
+        # self.merge_mp3_btn = ttk.Button(chunks_controls, text="🔗 Объединить в MP3", command=self.merge_wav_to_mp3_threaded)
+        # self.merge_mp3_btn.pack(side=tk.LEFT, padx=(15, 5))
 
         self.chunks_area = scrolledtext.ScrolledText(chunks_tab, wrap=tk.WORD, height=10, font=("Consolas", 9))
         self.chunks_area.pack(fill=tk.BOTH, expand=True)
@@ -476,7 +499,7 @@ class SileroTTSApp:
         self.create_tooltip(self.play_btn, "Генерить аудио и сразу возпроизводить без записи в файл")
 
         # Кнопка сохранения
-        self.save_btn = ttk.Button(controls_frame, text="💾 Озвучить все и сохранить MP3", command=self.save_audio_threaded)
+        self.save_btn = ttk.Button(controls_frame, text="💾 Озвучить и сохранить MP3", command=self.save_audio_threaded)
         self.save_btn.pack(side=tk.LEFT, padx=5)
         
         # Добавляем всплывающую подсказку на кнопку "Сделать универсальную функцию всплывающей подказки и Добавить ее только на кнопку Сохранить WAV"
@@ -857,6 +880,9 @@ class SileroTTSApp:
         use_ruaccent = bool(self._get_variable_value(self.use_ruaccent_var)) if hasattr(self, 'use_ruaccent_var') else False
 
         processed_text = text
+
+        # Сохраняем переносы строк как паузы ДО предобработки
+        processed_text = preserve_linebreaks_as_pauses(processed_text)
 
         if use_num2words:
             processed_text = self.text_preprocessor.replace_numbers_with_words(processed_text)
@@ -3220,6 +3246,9 @@ def run_cli(args):
             return 1
         
         logging.info(f"Текст для озвучки: {len(text)} символов")
+        
+        # Сохраняем переносы строк как паузы ДО предобработки
+        text = preserve_linebreaks_as_pauses(text)
         text = text.replace('^', '')
         
         # Предобработка текста если включена

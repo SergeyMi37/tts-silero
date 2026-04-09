@@ -4,7 +4,7 @@
   "window_geometry": "1333x878+230+89",
   "chunk_mode": true,
   "save_parts": true,
-  "max_chars_per_chunk": 600,
+  "max_chars_per_chunk": 1010,
   "silence_ms": 1000,
   "chunk_dir": "tempwav",
   "mp3_bitrate": "256k",
