@@ -77,6 +77,29 @@ DEFAULT_SILENCE_MS = 200
 # Тестовый текст по умолчанию
 DEFAULT_DEMO_TEXT = "Это демонстрация работы Silero TTS версии 5. Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности! В недрах тундры выдры в г+етрах т+ырят в вёдра ядра к+едров."
 
+
+def clean_xml_text(text):
+    """Очистка текста от символов, ломающих XML в SSML."""
+    text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+    text = text.replace('«', '"').replace('»', '"')
+    text = text.replace('—', '-').replace('–', '-')
+    text = text.replace('…', '...')
+    text = text.replace('^', '')
+    text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)', '&amp;', text)
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    text = ' '.join(text.split())
+    return text
+
+
+def add_pause_tags(text):
+    """Добавление тегов пауз <break> после предложений."""
+    if not text:
+        return text
+    result = re.sub(r'(?<=[.!?…])(?=\s|$)', '<break time="850ms"/>', text)
+    result = ' '.join(result.split())
+    return result
+
 class TextHandler(logging.Handler):
     """Кастомный обработчик логов для вывода в текстовое поле Tkinter"""
     def __init__(self, text_widget):
@@ -280,31 +303,6 @@ class SileroTTSApp:
         except Exception as e:
             logging.error(f"Ошибка при загрузке настроек: {e}")
             self.saved_config = {}
-    
-    def add_pause_tags(self, text):
-        """Добавление тегов пауз <s> после точек в конце предложений.
-        
-        Аргументы:
-            text: Текст для обработки
-        
-        Возвращает:
-            Текст с добавленными тегами пауз после точек (валидный XML)
-        """
-        if not text:
-            return text
-        
-        # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
-        # Заменяем . на <s>.</s>, ? на <s>?</s>, ! на <s>!</s>
-        result = re.sub(r'\.\s*', '<s>.</s> ', text)
-        result = re.sub(r'\?\s*', '<s>?</s> ', result)
-        result = re.sub(r'!\s*', '<s>!</s> ', result)
-        result = re.sub(r'…\s*', '<s>…</s> ', result)
-        
-        # Удаляем множественные пробелы
-        result = ' '.join(result.split())
-        
-        logging.debug(f"Добавлены теги пауз: '{text[:50]}...' → '{result[:50]}...'")
-        return result
     
     def _validate_geometry(self, geometry_str):
         """Валидация строки геометрии окна.
@@ -1070,12 +1068,9 @@ class SileroTTSApp:
                 # Логирование для отладки: содержимое chunk_text до обработки
                 logging.debug(f"CHUNK {idx:06d} (до обработки): '{chunk_text[:100]}...' (длина: {len(chunk_text)})")
                 
-                # Экранируем XML-символы в chunk_text перед вставкой в SSML
-                # Это сохраняет ударения и другие специальные символы
-                chunk_text_escaped = html.escape(chunk_text, quote=False)
-                
-                # Добавляем теги пауз после точек в конце предложений
-                chunk_with_pauses = self.add_pause_tags(chunk_text_escaped)
+                # Очистка и добавление пауз
+                chunk_cleaned = clean_xml_text(chunk_text)
+                chunk_with_pauses = add_pause_tags(chunk_cleaned)
                 
                 # Оборачиваем каждый чанк в SSML теги скорости
                 chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
@@ -1692,8 +1687,10 @@ class SileroTTSApp:
                 cmd_parts.append('--mp3')
                 if mp3_bitrate != '192k':
                     cmd_parts.append(f'--bitrate {mp3_bitrate}')
-                if delete_wav_dir:
-                    cmd_parts.append('--delete-parts')
+            
+            # Удаление директории с частями
+            if delete_wav_dir:
+                cmd_parts.append('--delete-parts')
             
             # Предобработка
             if use_preprocessing:
@@ -1986,33 +1983,11 @@ class SileroTTSApp:
             speech_rate = self._get_variable_value(self.speech_rate_var) if hasattr(self, 'speech_rate_var') else 'medium'
         
         try:
-            # Очистка текста от неподдерживаемых XML-символов
-            # Silero TTS v5 не поддерживает переносы строк, русские кавычки и другие спецсимволы в SSML
-            def clean_xml_text(text):
-                # Удаляем переносы строк (заменяем на пробелы)
-                text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-                # Заменяем русские кавычки на стандартные
-                text = text.replace('«', '"').replace('»', '"')
-                # Заменяем тире на дефис
-                text = text.replace('—', '-').replace('–', '-')
-                # Заменяем многоточие на три точки
-                text = text.replace('…', '...')
-                # Удаляем символы ударений ^ (модель не поддерживает)
-                text = text.replace('^', '')
-                # Экранируем амперсанд
-                text = text.replace('&', '&amp;')
-                # Буква ё поддерживается - оставляем как есть
-                # Удаляем множественные пробелы
-                text = ' '.join(text.split())
-                return text
-            
             # Проверяем, содержит ли текст уже SSML теги <speak>
             text_stripped = text.strip()
             if text_stripped.startswith('<speak>') and '</speak>' in text_stripped:
                 # Текст уже содержит SSML, используем как есть
                 # Но всё равно очищаем содержимое от неподдерживаемых символов
-                import re
-                # Извлекаем содержимое между <prosody ...> и </prosody>
                 match = re.search(r'<prosody[^>]*>(.*?)</prosody>', text_stripped, re.DOTALL)
                 if match:
                     inner_text = match.group(1)
@@ -2024,12 +1999,24 @@ class SileroTTSApp:
             else:
                 # Обёртка текста в SSML для управления скоростью
                 cleaned_text = clean_xml_text(text)
-                # Добавляем теги пауз после точек в конце предложений
-                text_with_pauses = self.add_pause_tags(cleaned_text)
+                text_with_pauses = add_pause_tags(cleaned_text)
                 ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
             
-            # Логирование финального SSML-текста с тегами скорости и ударениями
-            logging.info(f"Генерация аудио: текст='{ssml_text[:100]}...' (длина: {len(ssml_text)}), голос='{speaker}', скорость='{speech_rate}')")
+            # Подробное логирование SSML для отладки
+            logging.info(f"Генерация аудио: голос='{speaker}', скорость='{speech_rate}', длина SSML={len(ssml_text)}")
+            logging.info(f"SSML полный текст: {ssml_text}")
+            
+            # Валидация XML перед вызовом модели
+            try:
+                import xml.etree.ElementTree as ET
+                ET.fromstring(ssml_text)
+                logging.info("SSML валиден как XML")
+            except ET.ParseError as xml_err:
+                logging.error(f"SSML НЕ валиден! Ошибка XML: {xml_err}")
+                # Найдём позицию ошибки
+                err_str = str(xml_err)
+                logging.error(f"Проблемный SSML (полный): {ssml_text}")
+                raise ValueError(f"Невалидный SSML: {xml_err}") from xml_err
             
             # Генерация аудио с SSML
             audio = self.model.apply_tts(
@@ -3317,17 +3304,9 @@ def run_cli(args):
             for idx, chunk_text in enumerate(chunks, start=1):
                 logging.info(f"Обработка чанка {idx}/{len(chunks)}")
                 
-                # Очистка от неподдерживаемых символов (включая ^ для ударений)
-                chunk_text = chunk_text.replace('^', '')
-                
-                # Формирование SSML
-                chunk_escaped = html.escape(chunk_text, quote=False)
-                # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
-                chunk_with_pauses = re.sub(r'\.\s*', '<s>.</s> ', chunk_escaped)
-                chunk_with_pauses = re.sub(r'\?\s*', '<s>?</s> ', chunk_with_pauses)
-                chunk_with_pauses = re.sub(r'!\s*', '<s>!</s> ', chunk_with_pauses)
-                chunk_with_pauses = re.sub(r'…\s*', '<s>…</s> ', chunk_with_pauses)
-                chunk_with_pauses = ' '.join(chunk_with_pauses.split())
+                # Очистка и формирование SSML
+                cleaned = clean_xml_text(chunk_text)
+                chunk_with_pauses = add_pause_tags(cleaned)
                 ssml_text = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
                 
                 audio_tensor = model.apply_tts(
@@ -3411,15 +3390,8 @@ def run_cli(args):
             audio_full = None  # Не используется при потоковой записи
         else:
             logging.info("Генерация без разбиения на чанки")
-            # Очистка от неподдерживаемых символов (включая ^ для ударений)
-            text = text.replace('^', '')
-            text_escaped = html.escape(text, quote=False)
-            # Добавляем теги пауз <s> вокруг знаков препинания для валидного XML
-            text_with_pauses = re.sub(r'\.\s*', '<s>.</s> ', text_escaped)
-            text_with_pauses = re.sub(r'\?\s*', '<s>?</s> ', text_with_pauses)
-            text_with_pauses = re.sub(r'!\s*', '<s>!</s> ', text_with_pauses)
-            text_with_pauses = re.sub(r'…\s*', '<s>…</s> ', text_with_pauses)
-            text_with_pauses = ' '.join(text_with_pauses.split())
+            cleaned = clean_xml_text(text)
+            text_with_pauses = add_pause_tags(cleaned)
             ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
             
             audio_tensor = model.apply_tts(
