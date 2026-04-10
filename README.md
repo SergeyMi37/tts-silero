@@ -1,6 +1,6 @@
 # Silero TTS - Озвучка текста
 
-Приложение для преобразования текста в речь с использованием модели Silero TTS v5.
+Приложение для преобразования текста в речь с использованием модели Silero TTS v5.4.
 
 ## Установка
 
@@ -16,6 +16,9 @@ env\Scripts\activate  # Windows
 
 # Установить зависимости
 pip install -r requirements.txt
+
+# Если модель через torch.hub ругается на отсутствующие модули
+pip install omegaconf torchaudio
 ```
 
 ## Запуск
@@ -34,7 +37,7 @@ python text2mp3.py --text "Привет мир!" -o output.mp3
 python text2mp3.py -i book.txt -o audiobook.mp3 --chunks
 
 # Выбор голоса и скорости
-python text2mp3.py -i book.txt -o output.mp3 --speaker eugene --speech-rate slow --chunks
+python text2mp3.py -i book.txt -o output.mp3 --speaker xenia --speech-rate slow --chunks
 
 # С предобработкой и ударениями
 python text2mp3.py -i book.txt -o output.mp3 --chunks --preprocess --ruaccent
@@ -47,7 +50,7 @@ python text2mp3.py -i book.txt -o output.mp3 --chunks --preprocess --ruaccent
 | `--text`, `-t` | Текст для озвучки |
 | `--input-file`, `-i` | Файл (txt, fb2, zip) |
 | `--output`, `-o` | Выходной файл MP3 |
-| `--speaker`, `-s` | Голос: baya, eugene, kseniya, xenia, random |
+| `--speaker`, `-s` | Голос: aidar, baya, kseniya, xenia |
 | `--speech-rate`, `-r` | Скорость: x-slow, slow, medium, fast, x-fast |
 | `--chunks` | Разбить на чанки |
 | `--max-chars` | Макс. символов в чанке (по умолчанию 1200) |
@@ -63,7 +66,7 @@ python text2mp3.py -i book.txt -o output.mp3 --chunks --preprocess --ruaccent
 
 - Python 3.8+
 - torch
-- silero-tts-enhanced
+- silero-models через `torch.hub`
 - pygame, pydub
 - num2words, silero-stress, ruaccent
 - **ffmpeg** (для объединения MP3) — подробнее ниже
@@ -172,7 +175,7 @@ pyinstaller --onefile --windowed --name text2mp3 --icon=book-dyn.ico --add-data 
 
 ### Примечания
 
-- При первом запуске может потребоваться скачать модели Silero TTS
+- При первом запуске `torch.hub` скачает модель Silero TTS в локальный кэш
 - Файл будет весить ~200-400 МБ из-за включения Python и зависимостей
 - ffmpeg должен быть установлен в системе отдельно
 

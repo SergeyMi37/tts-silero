@@ -1,4 +1,6 @@
 torch
+torchaudio
+omegaconf
 numpy
 pygame
 scipy

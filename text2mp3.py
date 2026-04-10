@@ -19,6 +19,8 @@ from pydub import AudioSegment
 from text_preprocessor import TextPreprocessor
 import html
 import argparse
+import contextlib
+import io
 
 # Константы для логирования
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(funcName)s() - %(message)s'
@@ -49,8 +51,9 @@ logging.basicConfig(
 
 # Константы
 SAMPLE_RATE = 48000
-MODEL_URL = 'https://models.silero.ai/models/tts/ru/v5_ru.pt'
-MODEL_NAME = 'v5_ru.pt'
+MODEL_LANGUAGE = 'ru'
+MODEL_ID = 'v5_4_ru'
+MODEL_REPO = 'snakers4/silero-models'
 CONFIG_FILE = 'text2mp3.json'
 
 # Путь к кэшу модели в LOCALAPPDATA
@@ -58,7 +61,6 @@ CACHE_DIR = os.path.join(
     os.getenv('LOCALAPPDATA', os.path.expanduser('~')),
     'SileroTTS', 'models'
 )
-MODEL_FILE = os.path.join(CACHE_DIR, MODEL_NAME)
 
 # Путь к директории для сохранения аудио файлов
 AUDIO_DIR = os.path.join(
@@ -66,16 +68,68 @@ AUDIO_DIR = os.path.join(
     'SileroTTS', 'audiofiles'
 )
 
-# Доступные русские голоса из Silero v5
-SPEAKERS = ['baya', 'eugene', 'kseniya', 'xenia', 'random']
+# Доступные русские голоса из Silero v5.4
+SPEAKERS = ['aidar', 'baya', 'kseniya', 'xenia']
+DEFAULT_SPEAKER = 'xenia'
 
 # Настройки разбиения на кусочки больших текстов
 AUTO_CHUNK_THRESHOLD = 3000
 DEFAULT_MAX_CHARS_PER_CHUNK = 1010
 DEFAULT_SILENCE_MS = 200
+MODEL_SAFE_SUBCHUNK_CHARS = 400
+MODEL_SUBCHUNK_SILENCE_MS = 120
 
 # Тестовый текст по умолчанию
 DEFAULT_DEMO_TEXT = "Это демонстрация работы Silero TTS версии 5. Меня зовут Лева Королев. Я из готов. И я уже готов открыть все ваши замки любой сложности! В недрах тундры выдры в г+етрах т+ырят в вёдра ядра к+едров."
+
+
+def load_silero_tts_model(device, num_threads=4):
+    """Загрузка актуальной модели Silero TTS через torch.hub."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    torch.hub.set_dir(CACHE_DIR)
+    torch.set_num_threads(num_threads)
+
+    logging.info(
+        f"Загрузка Silero TTS через torch.hub: repo={MODEL_REPO}, language={MODEL_LANGUAGE}, model_id={MODEL_ID}"
+    )
+
+    @contextlib.contextmanager
+    def ensure_standard_streams():
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        fallback_stream = None
+
+        try:
+            if sys.stdout is None or sys.stderr is None:
+                fallback_stream = open(os.devnull, 'w', encoding='utf-8')
+                if sys.stdout is None:
+                    sys.stdout = fallback_stream
+                if sys.stderr is None:
+                    sys.stderr = fallback_stream
+            yield
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            if fallback_stream is not None:
+                fallback_stream.close()
+
+    try:
+        with ensure_standard_streams():
+            model, example_text = torch.hub.load(
+                repo_or_dir=MODEL_REPO,
+                model='silero_tts',
+                language=MODEL_LANGUAGE,
+                speaker=MODEL_ID
+            )
+    except ModuleNotFoundError as e:
+        missing_module = getattr(e, 'name', None) or str(e)
+        raise RuntimeError(
+            "Для загрузки Silero TTS через torch.hub не хватает зависимости "
+            f"`{missing_module}`. Установите зависимости из requirements.txt "
+            "или выполните `pip install omegaconf torchaudio`."
+        ) from e
+    model.to(device)
+    return model, example_text
 
 
 def preserve_linebreaks_as_pauses(text):
@@ -94,10 +148,11 @@ def preserve_linebreaks_as_pauses(text):
 def clean_xml_text(text):
     """Очистка текста от символов, ломающих XML в SSML."""
     text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-    text = text.replace('«', '"').replace('»', '"')
+    text = text.replace('«', '').replace('»', '').replace('"', '')
     text = text.replace('—', '-').replace('–', '-')
     text = text.replace('…', '...')
     text = text.replace('^', '')
+    text = text.replace('*', '')
     text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[0-9a-fA-F]+;)', '&amp;', text)
     # Временно сохраняем <break .../> теги
     breaks = []
@@ -115,6 +170,15 @@ def clean_xml_text(text):
     return text
 
 
+def normalize_ssml_break_tags(text):
+    """Нормализация break-тегов к валидному XML-виду."""
+    if not text:
+        return text
+
+    text = re.sub(r'<break\s+time\s*=\s*"?([0-9]+(?:ms|s))"?\s*/>', r'<break time="\1"/>', text)
+    return text
+
+
 def add_pause_tags(text):
     """Добавление тегов пауз <break> после предложений."""
     if not text:
@@ -122,6 +186,278 @@ def add_pause_tags(text):
     result = re.sub(r'(?<=[.!?…])(?=\s|$)', '<break time="850ms"/>', text)
     result = ' '.join(result.split())
     return result
+
+
+def strip_ssml_tags(text):
+    """Удаление SSML/XML тегов для безопасного fallback в plain text."""
+    if not text:
+        return text
+
+    text = re.sub(r'<break\s+time="(\d+)(ms|s)"\s*/>', ' ', text)
+    text = re.sub(r'</?(?:speak|prosody|p|s)\b[^>]*>', ' ', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    text = text.replace('«', '').replace('»', '').replace('"', '')
+    text = text.replace('*', '')
+    return ' '.join(text.split())
+
+
+def sanitize_plain_tts_text(text):
+    """Очистка plain text от символов, которые новая модель Silero может не принять."""
+    if not text:
+        return text
+
+    text = html.unescape(text)
+    text = text.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+    text = text.replace('«', '').replace('»', '').replace('"', '')
+    text = text.replace('*', '')
+    text = text.replace('&quot;', '')
+    text = text.replace('&apos;', '')
+    return ' '.join(text.split())
+
+
+def parse_break_time_to_ms(value):
+    """Преобразование значения break time в миллисекунды."""
+    if not value:
+        return 0
+
+    value = value.strip().lower()
+    if value.endswith('ms'):
+        return max(0, int(value[:-2]))
+    if value.endswith('s'):
+        return max(0, int(float(value[:-1]) * 1000))
+    return 0
+
+
+def split_ssml_for_explicit_breaks(ssml_text):
+    """Разбор SSML на текстовые сегменты и явные паузы."""
+    ssml_text = normalize_ssml_break_tags(ssml_text)
+
+    prosody_match = re.search(r'<prosody([^>]*)>(.*?)</prosody>', ssml_text, re.DOTALL)
+    if prosody_match:
+        prosody_attrs = prosody_match.group(1)
+        body = prosody_match.group(2)
+    else:
+        prosody_attrs = ''
+        speak_match = re.search(r'<speak>(.*?)</speak>', ssml_text, re.DOTALL)
+        body = speak_match.group(1) if speak_match else ssml_text
+
+    parts = re.split(r'(<break\s+time="[0-9]+(?:ms|s)"\s*/>)', body)
+    result = []
+    for part in parts:
+        if not part:
+            continue
+
+        break_match = re.fullmatch(r'<break\s+time="([0-9]+(?:ms|s))"\s*/>', part.strip())
+        if break_match:
+            pause_ms = parse_break_time_to_ms(break_match.group(1))
+            if pause_ms > 0:
+                result.append({'type': 'break', 'duration_ms': pause_ms})
+            continue
+
+        segment_text = part.strip()
+        if segment_text:
+            result.append({'type': 'text', 'text': segment_text, 'prosody_attrs': prosody_attrs})
+
+    return result
+
+
+def synthesize_text_segment(model, speaker, text, prosody_attrs=''):
+    """Синтез одного текстового сегмента с optional prosody, без break-тегов."""
+    segment_text = clean_xml_text(text)
+    if not segment_text:
+        return None
+
+    if prosody_attrs is not None:
+        segment_ssml = f'<speak><prosody{prosody_attrs}>{segment_text}</prosody></speak>'
+    else:
+        segment_ssml = f'<speak>{segment_text}</speak>'
+
+    try:
+        return model.apply_tts(
+            ssml_text=segment_ssml,
+            speaker=speaker,
+            sample_rate=SAMPLE_RATE,
+            put_accent=True,
+            put_yo=True
+        )
+    except (ValueError, KeyError, RuntimeError):
+        fallback_text = strip_ssml_tags(segment_ssml)
+        return generate_plain_audio_with_auto_split(model, fallback_text, speaker)
+
+
+def synthesize_ssml_with_explicit_breaks(model, speaker, ssml_text):
+    """Синтез SSML с гарантированной вставкой пауз через реальные сэмплы тишины."""
+    items = split_ssml_for_explicit_breaks(ssml_text)
+    if not items:
+        fallback_text = strip_ssml_tags(ssml_text)
+        return generate_plain_audio_with_auto_split(model, fallback_text, speaker)
+
+    tensors = []
+    reference_audio = None
+    pending_leading_silence = 0
+
+    for item in items:
+        if item['type'] == 'break':
+            silence_samples = int(SAMPLE_RATE * (item['duration_ms'] / 1000.0))
+            if silence_samples <= 0:
+                continue
+
+            if reference_audio is None:
+                pending_leading_silence += silence_samples
+            else:
+                tensors.append(torch.zeros(silence_samples, dtype=reference_audio.dtype, device=reference_audio.device))
+            continue
+
+        audio = synthesize_text_segment(
+            model,
+            speaker,
+            item['text'],
+            prosody_attrs=item.get('prosody_attrs', '')
+        )
+        if audio is None:
+            continue
+
+        if reference_audio is None:
+            reference_audio = audio
+            if pending_leading_silence > 0:
+                tensors.append(torch.zeros(pending_leading_silence, dtype=audio.dtype, device=audio.device))
+                pending_leading_silence = 0
+
+        tensors.append(audio)
+
+    if not tensors:
+        if pending_leading_silence > 0:
+            return torch.zeros(pending_leading_silence, dtype=torch.float32)
+        fallback_text = strip_ssml_tags(ssml_text)
+        return generate_plain_audio_with_auto_split(model, fallback_text, speaker)
+
+    return torch.cat(tensors)
+
+
+def split_text_into_chunks_generic(text, max_chars):
+    """Упрощенное универсальное разбиение текста на чанки без зависимости от UI."""
+    text = (text or '').replace('\r\n', '\n').replace('\r', '\n')
+    text = ' '.join(text.split())
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    pos = 0
+    text_len = len(text)
+
+    while pos < text_len:
+        remaining = text_len - pos
+        if remaining <= max_chars:
+            chunk = text[pos:].strip()
+            if chunk:
+                chunks.append(chunk)
+            break
+
+        window_end = min(pos + max_chars, text_len)
+        window = text[pos:window_end]
+        break_idx = None
+
+        for match in re.finditer(r'[.!?…]+', window):
+            end_pos = match.end()
+            if end_pos >= len(window) or window[end_pos] in ' \n':
+                if break_idx is None or end_pos > break_idx:
+                    break_idx = end_pos
+
+        if break_idx is None:
+            for match in re.finditer(r'[,;:]', window):
+                end_pos = match.end()
+                if end_pos >= len(window) or window[end_pos] in ' \n':
+                    if break_idx is None or end_pos > break_idx:
+                        break_idx = end_pos
+
+        if break_idx is None:
+            last_space = window.rfind(' ')
+            if last_space > 0 and last_space < len(window) - 1:
+                break_idx = last_space + 1
+
+        if break_idx is None:
+            break_idx = max_chars
+
+        chunk = text[pos:pos + break_idx].strip()
+        if chunk:
+            chunks.append(chunk)
+        pos = pos + break_idx
+
+    if pos < text_len:
+        remainder = text[pos:].strip()
+        if remainder and (not chunks or remainder != chunks[-1]):
+            chunks.append(remainder)
+
+    return chunks
+
+
+def is_tts_text_too_long_error(error):
+    """Определение типичной ошибки Silero при слишком длинном тексте."""
+    error_text = str(error).lower()
+    markers = [
+        "probably it's too long",
+        "couldn't generate your text",
+        "size of tensor a",
+        "must match the size of tensor b"
+    ]
+    return any(marker in error_text for marker in markers)
+
+
+def generate_plain_audio_with_auto_split(model, plain_text, speaker, depth=0):
+    """Генерация plain text с автоматическим разбиением на подчанки при ошибке длины."""
+    plain_text = sanitize_plain_tts_text(plain_text)
+    plain_text = (plain_text or '').strip()
+    if not plain_text:
+        raise ValueError("Пустой текст после очистки SSML")
+
+    try:
+        return model.apply_tts(
+            text=plain_text,
+            speaker=speaker,
+            sample_rate=SAMPLE_RATE,
+            put_accent=True,
+            put_yo=True
+        )
+    except Exception as plain_error:
+        if isinstance(plain_error, KeyError):
+            raise RuntimeError(
+                f"Модель Silero не поддерживает символ в тексте: {plain_error}. "
+                "Попробуйте убрать нестандартные знаки препинания или спецсимволы."
+            ) from plain_error
+
+        if not is_tts_text_too_long_error(plain_error):
+            raise
+
+        if len(plain_text) <= 120 or depth >= 6:
+            raise
+
+        next_max_chars = max(120, min(MODEL_SAFE_SUBCHUNK_CHARS, len(plain_text) // 2))
+        subchunks = split_text_into_chunks_generic(plain_text, next_max_chars)
+        if len(subchunks) <= 1:
+            raise
+
+        logging.warning(
+            f"Текст слишком длинный для модели, разбиваем автоматически на {len(subchunks)} подчанков "
+            f"(depth={depth}, max_chars={next_max_chars})"
+        )
+
+        audio_parts = []
+        silence_samples = int(SAMPLE_RATE * (MODEL_SUBCHUNK_SILENCE_MS / 1000.0))
+        silence_tensor = None
+
+        for idx, subchunk in enumerate(subchunks, start=1):
+            sub_audio = generate_plain_audio_with_auto_split(model, subchunk, speaker, depth=depth + 1)
+            audio_parts.append(sub_audio)
+            if silence_samples > 0 and idx != len(subchunks):
+                if silence_tensor is None:
+                    silence_tensor = torch.zeros(silence_samples, dtype=sub_audio.dtype, device=sub_audio.device)
+                audio_parts.append(silence_tensor)
+
+        return torch.cat(audio_parts)
 
 class TextHandler(logging.Handler):
     """Кастомный обработчик логов для вывода в текстовое поле Tkinter"""
@@ -175,7 +511,7 @@ class TextHandler(logging.Handler):
 class SileroTTSApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Озвучка текста - Silero TTS (v5)")
+        self.root.title("Озвучка текста - Silero TTS (v5.4)")
         self.root.geometry("1200x500")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -266,6 +602,26 @@ class SileroTTSApp:
     def _get_combobox_value(self, combobox):
         """Чтение значения Combobox строго из UI-потока."""
         return self._ui_call(combobox.get, wait=True)
+
+    def _sync_speakers_with_model(self):
+        """Синхронизация списка голосов в UI с фактически загруженной моделью."""
+        if not hasattr(self, 'speaker_combo') or self.model is None:
+            return
+
+        model_speakers = getattr(self.model, 'speakers', None)
+        if not model_speakers:
+            return
+
+        speakers = list(model_speakers)
+
+        def apply_sync():
+            self.speaker_combo['values'] = speakers
+            current_value = self.speaker_combo.get()
+            if current_value not in speakers:
+                fallback_speaker = DEFAULT_SPEAKER if DEFAULT_SPEAKER in speakers else speakers[0]
+                self.speaker_combo.set(fallback_speaker)
+
+        self._ui_call(apply_sync, wait=False)
     
     def create_tooltip(self, widget, text):
         """Универсальная функция создания всплывающей подсказки (tooltip).
@@ -539,7 +895,7 @@ class SileroTTSApp:
         ttk.Label(voice_frame, text="Выберите голос:", width=25, anchor=tk.W).pack(side=tk.LEFT)
         self.speaker_combo = ttk.Combobox(voice_frame, values=SPEAKERS, state="readonly", width=20)
         self.speaker_combo.pack(side=tk.LEFT, padx=5)
-        self.speaker_combo.current(0)  # baya по умолчанию
+        self.speaker_combo.set(DEFAULT_SPEAKER)
         logging.debug(f"Комбобокс голосов инициализирован со значениями {SPEAKERS}")
         
         # Скорость речи
@@ -747,9 +1103,16 @@ class SileroTTSApp:
             # Восстановление выбора голоса
             if 'speaker' in self.saved_config:
                 saved_speaker = self.saved_config['speaker']
-                if saved_speaker in SPEAKERS:
+                available_speakers = list(self.speaker_combo['values']) if hasattr(self, 'speaker_combo') else SPEAKERS
+                if saved_speaker in available_speakers:
                     self.speaker_combo.set(saved_speaker)
                     logging.debug(f"Голос восстановлен: {saved_speaker}")
+                elif hasattr(self, 'speaker_combo'):
+                    fallback_speaker = DEFAULT_SPEAKER if DEFAULT_SPEAKER in available_speakers else available_speakers[0]
+                    self.speaker_combo.set(fallback_speaker)
+                    logging.warning(
+                        f"Сохранённый голос '{saved_speaker}' недоступен, выбран '{fallback_speaker}'"
+                    )
             
             # Восстановление текста
             if 'text' in self.saved_config and self.saved_config['text']:
@@ -1100,6 +1463,7 @@ class SileroTTSApp:
                 
                 # Оборачиваем каждый чанк в SSML теги скорости
                 chunk_with_ssml = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
+                chunk_with_ssml = normalize_ssml_break_tags(chunk_with_ssml)
                 
                 # Логирование для отладки: финальный SSML
                 logging.debug(f"CHUNK {idx:06d} (SSML): '{chunk_with_ssml[:120]}...' (длина: {len(chunk_with_ssml)})")
@@ -1936,52 +2300,26 @@ class SileroTTSApp:
         thread.start()
     
     def load_model(self):
-        """Загрузка модели Silero TTS v5"""
+        """Загрузка модели Silero TTS v5.4"""
         try:
             logging.info("=== Начало процесса загрузки модели ===")
             self.update_status("Статус: Загрузка модели...")
             self.start_progress()
-            
-            # Создание директории кэша, если не существует
-            if not os.path.exists(CACHE_DIR):
-                os.makedirs(CACHE_DIR, exist_ok=True)
-                logging.info(f"Создана директория кэша: {CACHE_DIR}")
-            
-            # Проверка наличия файла модели
-            if not os.path.isfile(MODEL_FILE):
-                logging.info(f"Файл модели {MODEL_FILE} не найден. Начинается скачивание...")
-                self.update_status("Статус: Скачивание модели в кэш (первый запуск может занять время)...")
-                
-                # Проверка доступности URL
-                try:
-                    torch.hub.download_url_to_file(MODEL_URL, MODEL_FILE, progress=True)
-                    file_size = os.path.getsize(MODEL_FILE) / (1024 * 1024)
-                    logging.info(f"Модель успешно скачана: {MODEL_FILE} ({file_size:.2f} МБ)")
-                except Exception as e:
-                    logging.error(f"Ошибка при скачивании модели: {e}", exc_info=True)
-                    raise Exception(f"Не удалось скачать модель: {e}")
-            else:
-                file_size = os.path.getsize(MODEL_FILE) / (1024 * 1024)  # в МБ
-                logging.info(f"Файл модели {MODEL_FILE} уже существует в кэше (размер: {file_size:.2f} МБ)")
-            
-            # Проверка целостности файла
-            if os.path.getsize(MODEL_FILE) < 1000000:  # Меньше 1 МБ
-                logging.warning(f"Файл модели подозрительно мал: {os.path.getsize(MODEL_FILE)} байт")
-            
-            # Загрузка модели
             logging.info("Начинается загрузка модели в память...")
             device = torch.device('cpu')
-            torch.set_num_threads(4)
             logging.debug(f"Установлено количество потоков CPU: 4, устройство: {device}")
-            
+
             try:
-                self.model = torch.package.PackageImporter(MODEL_FILE).load_pickle("tts_models", "model")
-                self.model.to(device)
+                self.update_status("Статус: Загрузка модели через torch.hub...")
+                self.model, example_text = load_silero_tts_model(device, num_threads=4)
                 logging.info("Модель успешно загружена в память")
+                if example_text:
+                    logging.debug(f"Пример текста модели: {example_text[:120]}")
                 
                 # Проверка модели
                 if hasattr(self.model, 'speakers'):
                     logging.info(f"Доступные спикеры в модели: {self.model.speakers}")
+                    self._sync_speakers_with_model()
                 else:
                     logging.warning("Модель не имеет атрибута speakers")
                 
@@ -1999,9 +2337,9 @@ class SileroTTSApp:
             self.update_status("Статус: Ошибка загрузки ❌")
             self.show_error("Ошибка загрузки модели", str(e))
             self.stop_progress()
-    
+
     def generate_audio(self, text, speaker, speech_rate=None):
-        """Генерация аудио из текста с поддержкой скорости через SSML"""
+        """Генерация аудио из текста с поддержкой SSML и безопасным fallback."""
         if not self.is_model_loaded:
             raise Exception("Модель не загружена")
         
@@ -2027,6 +2365,8 @@ class SileroTTSApp:
                 cleaned_text = clean_xml_text(text)
                 text_with_pauses = add_pause_tags(cleaned_text)
                 ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
+
+            ssml_text = normalize_ssml_break_tags(ssml_text)
             
             # Подробное логирование SSML для отладки
             logging.info(f"Генерация аудио: голос='{speaker}', скорость='{speech_rate}', длина SSML={len(ssml_text)}")
@@ -2039,19 +2379,23 @@ class SileroTTSApp:
                 logging.info("SSML валиден как XML")
             except ET.ParseError as xml_err:
                 logging.error(f"SSML НЕ валиден! Ошибка XML: {xml_err}")
-                # Найдём позицию ошибки
-                err_str = str(xml_err)
                 logging.error(f"Проблемный SSML (полный): {ssml_text}")
-                raise ValueError(f"Невалидный SSML: {xml_err}") from xml_err
+                fallback_text = strip_ssml_tags(ssml_text)
+                logging.warning("SSML невалиден, используем plain text fallback")
+                audio = generate_plain_audio_with_auto_split(self.model, fallback_text, speaker)
+                logging.info(f"Аудио сгенерировано успешно. Тип: {type(audio)}, форма: {audio.shape if hasattr(audio, 'shape') else 'неизвестно'}")
+                return audio
             
-            # Генерация аудио с SSML
-            audio = self.model.apply_tts(
-                ssml_text=ssml_text,
-                speaker=speaker,
-                sample_rate=SAMPLE_RATE,
-                put_accent=True,
-                put_yo=True
-            )
+            try:
+                # Генерация аудио с гарантированной поддержкой явных break-пауз
+                audio = synthesize_ssml_with_explicit_breaks(self.model, speaker, ssml_text)
+            except (ValueError, KeyError, RuntimeError) as ssml_error:
+                fallback_text = strip_ssml_tags(ssml_text)
+                logging.warning(
+                    f"Silero не смог обработать SSML, используем plain text fallback: {ssml_error}"
+                )
+                logging.info(f"Fallback text: {fallback_text}")
+                audio = generate_plain_audio_with_auto_split(self.model, fallback_text, speaker)
             
             logging.info(f"Аудио сгенерировано успешно. Тип: {type(audio)}, форма: {audio.shape if hasattr(audio, 'shape') else 'неизвестно'}")
             return audio
@@ -3263,21 +3607,25 @@ def run_cli(args):
             logging.info(f"Текст предобработан: {len(text)} символов")
         
         # Загрузка модели
-        logging.info(f"Загрузка модели TTS из: {MODEL_FILE}")
+        logging.info(
+            f"Загрузка модели TTS через torch.hub: repo={MODEL_REPO}, language={MODEL_LANGUAGE}, model_id={MODEL_ID}"
+        )
         device = torch.device('cpu')
-        torch.set_num_threads(args.threads if hasattr(args, 'threads') else 4)
-        
-        if not os.path.exists(MODEL_FILE):
-            logging.info("Модель не найдена, начинается скачивание...")
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            torch.hub.download_url_to_file(MODEL_URL, MODEL_FILE, progress=True)
-        
-        model = torch.package.PackageImporter(MODEL_FILE).load_pickle("tts_models", "model")
-        model.to(device)
+        model, example_text = load_silero_tts_model(
+            device,
+            num_threads=args.threads if hasattr(args, 'threads') else 4
+        )
         logging.info("Модель загружена")
+        if example_text:
+            logging.debug(f"Пример текста модели: {example_text[:120]}")
         
         # Получение параметров
-        speaker = args.speaker if args.speaker else 'baya'
+        available_speakers = list(getattr(model, 'speakers', [])) or SPEAKERS
+        speaker = args.speaker if args.speaker else DEFAULT_SPEAKER
+        if speaker not in available_speakers:
+            raise ValueError(
+                f"Голос '{speaker}' недоступен в загруженной модели. Доступные голоса: {', '.join(available_speakers)}"
+            )
         speech_rate = args.speech_rate if hasattr(args, 'speech_rate') else 'medium'
         max_chars = args.max_chars if hasattr(args, 'max_chars') else DEFAULT_MAX_CHARS_PER_CHUNK
         silence_ms = args.silence_ms if hasattr(args, 'silence_ms') else DEFAULT_SILENCE_MS
@@ -3338,13 +3686,20 @@ def run_cli(args):
                 chunk_with_pauses = add_pause_tags(cleaned)
                 ssml_text = f'<speak><prosody rate="{speech_rate}">{chunk_with_pauses}</prosody></speak>'
                 
-                audio_tensor = model.apply_tts(
-                    ssml_text=ssml_text,
-                    speaker=speaker,
-                    sample_rate=SAMPLE_RATE,
-                    put_accent=True,
-                    put_yo=True
-                )
+                try:
+                    audio_tensor = model.apply_tts(
+                        ssml_text=ssml_text,
+                        speaker=speaker,
+                        sample_rate=SAMPLE_RATE,
+                        put_accent=True,
+                        put_yo=True
+                    )
+                except (ValueError, KeyError, RuntimeError) as ssml_error:
+                    fallback_text = strip_ssml_tags(ssml_text)
+                    logging.warning(
+                        f"Silero не смог обработать SSML для чанка {idx}, используем plain text fallback: {ssml_error}"
+                    )
+                    audio_tensor = generate_plain_audio_with_auto_split(model, fallback_text, speaker)
                 audio_int16 = (audio_tensor.numpy() * 32767).astype(np_module.int16)
                 if len(audio_int16.shape) == 2:
                     audio_int16 = audio_int16[:, 0]
@@ -3423,13 +3778,20 @@ def run_cli(args):
             text_with_pauses = add_pause_tags(cleaned)
             ssml_text = f'<speak><prosody rate="{speech_rate}">{text_with_pauses}</prosody></speak>'
             
-            audio_tensor = model.apply_tts(
-                ssml_text=ssml_text,
-                speaker=speaker,
-                sample_rate=SAMPLE_RATE,
-                put_accent=True,
-                put_yo=True
-            )
+            try:
+                audio_tensor = model.apply_tts(
+                    ssml_text=ssml_text,
+                    speaker=speaker,
+                    sample_rate=SAMPLE_RATE,
+                    put_accent=True,
+                    put_yo=True
+                )
+            except (ValueError, KeyError, RuntimeError) as ssml_error:
+                fallback_text = strip_ssml_tags(ssml_text)
+                logging.warning(
+                    f"Silero не смог обработать SSML, используем plain text fallback: {ssml_error}"
+                )
+                audio_tensor = generate_plain_audio_with_auto_split(model, fallback_text, speaker)
             audio_full = (audio_tensor.numpy() * 32767).astype(np.int16)
             if len(audio_full.shape) == 2:
                 audio_full = audio_full[:, 0]
